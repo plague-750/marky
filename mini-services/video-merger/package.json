@@ -1,0 +1,1 @@
+{"name":"video-merger","private":true,"scripts":{"dev":"bun --hot index.ts"}}
