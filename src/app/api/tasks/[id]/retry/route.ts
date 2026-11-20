@@ -1,6 +1,7 @@
 // POST /api/tasks/{id}/retry — إعادة إنتاج مهمة يدويًا من لوحة المهام
 // متاحة لأي حالة (فاشلة/جارية عالقة/مكتملة) وأي نوع (صورة/فيديو/دمج):
 // تصفير كامل للمهمة ثم محاولة إنشاء فورية بنفس المعطيات الأصلية وبنفس task_id.
+// جسم الطلب اختياري: { force_provider?: string } — إجبار المحاولة على مزود محدد (أداة retry_task).
 import { NextRequest } from "next/server";
 import { ensureSchema, getTask, serializeTask } from "@/lib/turso";
 import { retryGenerationTask } from "@/lib/generation";
@@ -9,14 +10,25 @@ import { retryMergeTask } from "@/lib/merge";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   await ensureSchema();
   const { id } = await ctx.params;
 
   const task = await getTask(id);
   if (!task) return Response.json({ error: "لا توجد مهمة بهذا المعرّف" }, { status: 404 });
 
-  const updated = task.type === "merge" ? await retryMergeTask(id) : await retryGenerationTask(id);
+  let forceProvider: string | undefined;
+  try {
+    const body = (await req.json()) as { force_provider?: string };
+    if (typeof body?.force_provider === "string" && body.force_provider.trim()) {
+      forceProvider = body.force_provider.trim();
+    }
+  } catch {
+    // جسم فارغ — مقبول
+  }
+
+  const updated =
+    task.type === "merge" ? await retryMergeTask(id) : await retryGenerationTask(id, forceProvider);
   if (!updated) {
     return Response.json({ error: "لا يمكن إعادة إنتاج هذا النوع من المهام" }, { status: 400 });
   }

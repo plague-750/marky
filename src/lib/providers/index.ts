@@ -1,18 +1,30 @@
-// سجل المحولات — إرجاع المحول المناسب لكل مزود
-import type { ProviderId } from "../models";
+// سجل المحولات — إرجاع المحول المناسب حسب adapter_type المضبوط للمزود في قاعدة البيانات
+// قابل للتوسع: أضف محولًا جديدًا هنا وسيعمل مع أي مزود يختاره من الواجهة
+import type { ProviderRuntime } from "./types";
 import { kieAdapter } from "./kie";
 import { cometapiAdapter } from "./cometapi";
+import { getProviderById } from "../turso";
 import type { ProviderAdapter } from "./types";
 
-export function getAdapter(provider: string): ProviderAdapter {
-  switch (provider) {
-    case "kie":
-      return kieAdapter;
-    case "cometapi":
-      return cometapiAdapter;
-    default:
-      throw new Error(`مزود غير معروف: ${provider}`);
-  }
+const ADAPTERS: Record<string, ProviderAdapter> = {
+  kie: kieAdapter,
+  cometapi: cometapiAdapter,
+};
+
+/** المحول حسب نوعه المخزّن في جدول providers (adapter_type) — نوع غير معروف → خطأ واضح */
+export function getAdapterByType(adapterType: string): ProviderAdapter {
+  const adapter = ADAPTERS[(adapterType || "kie").toLowerCase()];
+  if (!adapter) throw new Error(`نوع محول غير معروف: ${adapterType} — المتاح: ${Object.keys(ADAPTERS).join("، ")}`);
+  return adapter;
 }
 
-export type { ProviderId };
+/** جلب إعدادات المزود الحية من قاعدة البيانات + محوله — مزود مفقود/معطل → null */
+export async function resolveProvider(providerId: string): Promise<{ provider: ProviderRuntime; adapter: ProviderAdapter } | null> {
+  const provider = await getProviderById(providerId);
+  if (!provider || !provider.enabled) return null;
+  const adapter = ADAPTERS[(provider.adapter_type || "kie").toLowerCase()];
+  if (!adapter) return null;
+  return { provider, adapter };
+}
+
+export type { ProviderAdapter, ProviderRuntime } from "./types";

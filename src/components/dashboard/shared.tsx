@@ -24,6 +24,7 @@ export interface HealthResponse {
   database: "turso-connected" | "turso-disconnected";
   mcpEndpoint: string;
   models: HealthModel[];
+  providers?: Array<{ id: string; name: string; base_url: string; adapter_type: string; enabled: number }>;
   merger: { base: string; healthy: boolean };
   authRequired: boolean;
 }
@@ -54,6 +55,44 @@ export interface ApiName {
 export interface KeysResponse {
   keys: ApiKey[];
   names: ApiName[];
+}
+
+/* ------------------- أنواع المزودين وخرائط الموديلات (قسم 6) ------------------- */
+
+/** مزود من جدول providers — إعدادات الاتصال الحقيقية قابلة للتعديل */
+export interface ProviderRow {
+  id: string;
+  name: string;
+  base_url: string;
+  auth_type: string; // bearer | header | query
+  auth_header: string;
+  adapter_type: string; // kie | cometapi
+  image_endpoint: string;
+  video_endpoint: string;
+  check_endpoint: string;
+  enabled: number; // 1 | 0
+  created_at: string;
+}
+
+export interface ProvidersResponse {
+  providers: ProviderRow[];
+}
+
+/** خريطة موديل من جدول model_mappings — canonical ← اسم الموديل لدى مزود */
+export interface ModelMapping {
+  id: number;
+  canonical: string;
+  type: "image" | "video";
+  provider_id: string;
+  provider_model_name: string;
+  default_params_json: string | null;
+  priority: number;
+  enabled: number; // 1 | 0
+  created_at: string;
+}
+
+export interface ModelsResponse {
+  mappings: ModelMapping[];
 }
 
 export type TaskType = "image" | "video" | "merge";
@@ -87,12 +126,6 @@ export interface Task {
 export interface TasksResponse {
   stats: { total: number; completed: number; failed: number; processing: number };
   tasks: Task[];
-}
-
-/** استجابة POST /api/generate — استوديو التوليد */
-export interface GenerateResponse {
-  outcome: "completed" | "processing" | "failed";
-  task: Task;
 }
 
 /* ------------------------- تسميات البروتوكولات والاستخدام ------------------------- */
@@ -216,6 +249,15 @@ export function toAbsoluteUrl(url: string): string {
 }
 
 /* --------------------- استقصاء /api/health كل 15 ثانية --------------------- */
+
+/** حدث مشترك: يتقال عند أي تغيير في المزودين — تحديث فوري لقوائم «طريقة الاتصال» و«مزود الخريطة» */
+export const PROVIDERS_CHANGED_EVENT = "media-generator:providers-changed";
+
+export function notifyProvidersChanged(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(PROVIDERS_CHANGED_EVENT));
+  }
+}
 
 export function useHealthPoller(
   intervalMs = 15000,

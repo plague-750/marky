@@ -92,6 +92,34 @@ export interface ApiNameRow {
   updated_at: string;
 }
 
+/** صف مزود — إعدادات الاتصال الفعلية قابلة للتعديل من قاعدة البيانات (قسم 3 من المواصفة) */
+export interface ProviderRow {
+  id: string;
+  name: string;
+  base_url: string;
+  auth_type: string; // bearer | header | query
+  auth_header: string;
+  adapter_type: string; // kie | cometapi — يحدد شكل النداءات
+  image_endpoint: string;
+  video_endpoint: string;
+  check_endpoint: string;
+  enabled: number; // 1 | 0
+  created_at: string;
+}
+
+/** صف خريطة موديل — canonical موحد ← اسم الموديل لدى مزود معين (قسم 4 من المواصفة) */
+export interface ModelMappingRow {
+  id: number;
+  canonical: string;
+  type: string; // image | video
+  provider_id: string;
+  provider_model_name: string;
+  default_params_json: string | null;
+  priority: number;
+  enabled: number; // 1 | 0
+  created_at: string;
+}
+
 export type SafeKey = Omit<KeyRow, "api_key"> & { masked_key: string };
 
 export function toSafeKey(k: KeyRow): SafeKey {
@@ -152,6 +180,32 @@ const SCHEMA_SQL = [
   last_error TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 )`,
+  // المزودون — إعدادات الاتصال ديناميكية من قاعدة البيانات وليست Hardcoded (قسم 3)
+  `CREATE TABLE IF NOT EXISTS providers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  auth_type TEXT DEFAULT 'bearer',
+  auth_header TEXT DEFAULT 'Authorization',
+  adapter_type TEXT DEFAULT 'kie',
+  image_endpoint TEXT,
+  video_endpoint TEXT,
+  check_endpoint TEXT,
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now'))
+)`,
+  // خرائط الموديلات — canonical → اسم الموديل لدى كل مزود حسب الأولوية (قسم 4)
+  `CREATE TABLE IF NOT EXISTS model_mappings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  canonical TEXT NOT NULL,
+  type TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  provider_model_name TEXT NOT NULL,
+  default_params_json TEXT,
+  priority INTEGER DEFAULT 0,
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now'))
+)`,
 ];
 
 export async function ensureSchema(): Promise<void> {
@@ -159,6 +213,7 @@ export async function ensureSchema(): Promise<void> {
     _schemaPromise = (async () => {
       for (const sql of SCHEMA_SQL) await getTurso().execute(sql);
       await migrateSchema();
+      await seedProvidersAndMappings();
       await seedKeyIfEmpty();
     })().catch((e) => {
       // اترك المحاولة للتكرار القادم عند فشل عابر
@@ -387,9 +442,10 @@ function rowToKey(r: Record<string, unknown>): KeyRow {
  * الأهلية: حسب «استخدام المفتاح» (both/image/video) + الحالة (المستنزف يبقى، المعطّل يُستبعد)
  * + البروتوكول يجب أن يكون من بروتوكولات الموديل المدعومة.
  */
-export async function getKeyPoolForTask(kind: "image" | "video", protocols: string[]): Promise<KeyRow[]> {
+export async function getKeyPoolForTask(kind: "image" | "video", protocols: string[], forceProvider?: string): Promise<KeyRow[]> {
   if (!protocols.length) return [];
-  const protocolPlaceholders = protocols.map(() => "?").join(", ");
+  const filtered = forceProvider ? [forceProvider] : protocols;
+  const protocolPlaceholders = filtered.map(() => "?").join(", ");
   const rs = await getTurso().execute({
     sql: `SELECT * FROM api_keys
           WHERE status != 'disabled'
@@ -398,7 +454,7 @@ export async function getKeyPoolForTask(kind: "image" | "video", protocols: stri
           ORDER BY (SELECT MIN(k2.created_at) FROM api_keys k2
                     WHERE k2.provider COLLATE NOCASE = api_keys.provider COLLATE NOCASE) ASC,
                    created_at ASC, id ASC`,
-    args: [kind, ...protocols],
+    args: [kind, ...filtered],
   });
   return rs.rows.map((r) => rowToKey(r as Record<string, unknown>));
 }
@@ -568,4 +624,292 @@ export async function bumpKeyStats(
       ? [now, now, id]
       : [now, now, errorMessage ? `[${errorClass ?? "unknown"}] ${errorMessage}`.slice(0, 500) : "[unknown] خطأ غير مصنف", id],
   });
+}
+
+// ----------------------------- المزودون (قسم 3 من المواصفة) -----------------------------
+
+export const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9_-]{0,40}$/i;
+export const ADAPTER_TYPES = new Set(["kie", "cometapi"]);
+export const AUTH_TYPES = new Set(["bearer", "header", "query"]);
+
+function rowToProvider(r: Record<string, unknown>): ProviderRow {
+  return {
+    id: String(r.id ?? ""),
+    name: String(r.name ?? ""),
+    base_url: String(r.base_url ?? ""),
+    auth_type: String(r.auth_type ?? "bearer"),
+    auth_header: String(r.auth_header ?? "Authorization"),
+    adapter_type: String(r.adapter_type ?? "kie"),
+    image_endpoint: String(r.image_endpoint ?? ""),
+    video_endpoint: String(r.video_endpoint ?? ""),
+    check_endpoint: String(r.check_endpoint ?? ""),
+    enabled: Number(r.enabled ?? 1) ? 1 : 0,
+    created_at: String(r.created_at ?? ""),
+  };
+}
+
+export async function listProviders(): Promise<ProviderRow[]> {
+  const rs = await getTurso().execute("SELECT * FROM providers ORDER BY created_at ASC, id ASC");
+  return rs.rows.map((r) => rowToProvider(r as Record<string, unknown>));
+}
+
+export async function getProviderById(id: string): Promise<ProviderRow | null> {
+  const rs = await getTurso().execute({ sql: "SELECT * FROM providers WHERE id = ?", args: [id] });
+  if (!rs.rows.length) return null;
+  return rowToProvider(rs.rows[0] as Record<string, unknown>);
+}
+
+export interface ProviderPatch {
+  name?: string;
+  base_url?: string;
+  auth_type?: string;
+  auth_header?: string;
+  adapter_type?: string;
+  image_endpoint?: string;
+  video_endpoint?: string;
+  check_endpoint?: string;
+  enabled?: number;
+}
+
+export async function insertProvider(p: {
+  id: string;
+  name: string;
+  base_url: string;
+  auth_type?: string;
+  auth_header?: string;
+  adapter_type?: string;
+  image_endpoint?: string;
+  video_endpoint?: string;
+  check_endpoint?: string;
+  enabled?: number;
+}): Promise<ProviderRow> {
+  await getTurso().execute({
+    sql: `INSERT INTO providers (id, name, base_url, auth_type, auth_header, adapter_type, image_endpoint, video_endpoint, check_endpoint, enabled, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      p.id,
+      p.name,
+      p.base_url,
+      p.auth_type || "bearer",
+      p.auth_header || "Authorization",
+      p.adapter_type || "kie",
+      p.image_endpoint || "",
+      p.video_endpoint || "",
+      p.check_endpoint || "",
+      p.enabled === undefined ? 1 : p.enabled ? 1 : 0,
+      nowIso(),
+    ],
+  });
+  return (await getProviderById(p.id))!;
+}
+
+export async function patchProvider(id: string, patch: ProviderPatch): Promise<ProviderRow | null> {
+  const sets: string[] = [];
+  const args: InValue[] = [];
+  const set = (col: string, val: InValue) => {
+    sets.push(`${col} = ?`);
+    args.push(val);
+  };
+  if (patch.name !== undefined) set("name", patch.name);
+  if (patch.base_url !== undefined) set("base_url", patch.base_url);
+  if (patch.auth_type !== undefined) set("auth_type", patch.auth_type);
+  if (patch.auth_header !== undefined) set("auth_header", patch.auth_header);
+  if (patch.adapter_type !== undefined) set("adapter_type", patch.adapter_type);
+  if (patch.image_endpoint !== undefined) set("image_endpoint", patch.image_endpoint);
+  if (patch.video_endpoint !== undefined) set("video_endpoint", patch.video_endpoint);
+  if (patch.check_endpoint !== undefined) set("check_endpoint", patch.check_endpoint);
+  if (patch.enabled !== undefined) set("enabled", patch.enabled ? 1 : 0);
+  if (!sets.length) return getProviderById(id);
+  await getTurso().execute({ sql: `UPDATE providers SET ${sets.join(", ")} WHERE id = ?`, args: [...args, id] });
+  return getProviderById(id);
+}
+
+/** حذف مزود — يحذف معه خرائط موديلاته ومفاتيحه المتصلة به (تعطيل الاتصال بها أثناء التوليد) */
+export async function deleteProvider(id: string): Promise<boolean> {
+  const rs = await getTurso().execute({ sql: "DELETE FROM providers WHERE id = ?", args: [id] });
+  if (rs.rowsAffected > 0) {
+    await getTurso().execute({ sql: "DELETE FROM model_mappings WHERE provider_id = ?", args: [id] });
+    await getTurso().execute({ sql: "DELETE FROM api_keys WHERE protocol = ?", args: [id] });
+    return true;
+  }
+  return false;
+}
+
+// ----------------------------- خرائط الموديلات (قسم 4 من المواصفة) -----------------------------
+
+function rowToMapping(r: Record<string, unknown>): ModelMappingRow {
+  return {
+    id: Number(r.id ?? 0),
+    canonical: String(r.canonical ?? ""),
+    type: String(r.type ?? "image"),
+    provider_id: String(r.provider_id ?? ""),
+    provider_model_name: String(r.provider_model_name ?? ""),
+    default_params_json: (r.default_params_json as string | null) ?? null,
+    priority: Number(r.priority ?? 0),
+    enabled: Number(r.enabled ?? 1) ? 1 : 0,
+    created_at: String(r.created_at ?? ""),
+  };
+}
+
+export async function listModelMappings(filter?: {
+  canonical?: string;
+  type?: string;
+  provider_id?: string;
+}): Promise<ModelMappingRow[]> {
+  const where: string[] = [];
+  const args: InValue[] = [];
+  if (filter?.canonical) {
+    where.push("canonical = ?");
+    args.push(filter.canonical);
+  }
+  if (filter?.type) {
+    where.push("type = ?");
+    args.push(filter.type);
+  }
+  if (filter?.provider_id) {
+    where.push("provider_id = ?");
+    args.push(filter.provider_id);
+  }
+  const rs = await getTurso().execute({
+    sql: `SELECT * FROM model_mappings ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY canonical ASC, priority ASC, id ASC`,
+    args,
+  });
+  return rs.rows.map((r) => rowToMapping(r as Record<string, unknown>));
+}
+
+export async function getEnabledMappingsForModel(
+  canonical: string,
+  type: string,
+): Promise<ModelMappingRow[]> {
+  const rs = await getTurso().execute({
+    sql: `SELECT m.* FROM model_mappings m
+          JOIN providers p ON p.id = m.provider_id AND p.enabled = 1
+          WHERE m.canonical = ? AND m.type = ? AND m.enabled = 1
+          ORDER BY m.priority ASC, m.id ASC`,
+    args: [canonical, type],
+  });
+  return rs.rows.map((r) => rowToMapping(r as Record<string, unknown>));
+}
+
+export async function insertModelMapping(m: {
+  canonical: string;
+  type: string;
+  provider_id: string;
+  provider_model_name: string;
+  default_params_json?: string;
+  priority?: number;
+  enabled?: number;
+}): Promise<ModelMappingRow> {
+  const rs = await getTurso().execute({
+    sql: `INSERT INTO model_mappings (canonical, type, provider_id, provider_model_name, default_params_json, priority, enabled, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      m.canonical,
+      m.type,
+      m.provider_id,
+      m.provider_model_name,
+      m.default_params_json || null,
+      m.priority === undefined ? 0 : m.priority,
+      m.enabled === undefined ? 1 : m.enabled ? 1 : 0,
+      nowIso(),
+    ],
+  });
+  const id = Number(rs.lastInsertRowid ?? 0);
+  const back = await getTurso().execute({ sql: "SELECT * FROM model_mappings WHERE id = ?", args: [id] });
+  return rowToMapping(back.rows[0] as Record<string, unknown>);
+}
+
+export interface ModelMappingPatch {
+  canonical?: string;
+  type?: string;
+  provider_id?: string;
+  provider_model_name?: string;
+  default_params_json?: string | null;
+  priority?: number;
+  enabled?: number;
+}
+
+export async function patchModelMapping(id: number, patch: ModelMappingPatch): Promise<ModelMappingRow | null> {
+  const sets: string[] = [];
+  const args: InValue[] = [];
+  const set = (col: string, val: InValue) => {
+    sets.push(`${col} = ?`);
+    args.push(val);
+  };
+  if (patch.canonical !== undefined) set("canonical", patch.canonical);
+  if (patch.type !== undefined) set("type", patch.type);
+  if (patch.provider_id !== undefined) set("provider_id", patch.provider_id);
+  if (patch.provider_model_name !== undefined) set("provider_model_name", patch.provider_model_name);
+  if (patch.default_params_json !== undefined) set("default_params_json", patch.default_params_json);
+  if (patch.priority !== undefined) set("priority", patch.priority);
+  if (patch.enabled !== undefined) set("enabled", patch.enabled ? 1 : 0);
+  if (!sets.length) return getModelMappingById(id);
+  await getTurso().execute({ sql: `UPDATE model_mappings SET ${sets.join(", ")} WHERE id = ?`, args: [...args, id] });
+  return getModelMappingById(id);
+}
+
+export async function getModelMappingById(id: number): Promise<ModelMappingRow | null> {
+  const rs = await getTurso().execute({ sql: "SELECT * FROM model_mappings WHERE id = ?", args: [id] });
+  if (!rs.rows.length) return null;
+  return rowToMapping(rs.rows[0] as Record<string, unknown>);
+}
+
+export async function deleteModelMapping(id: number): Promise<boolean> {
+  const rs = await getTurso().execute({ sql: "DELETE FROM model_mappings WHERE id = ?", args: [id] });
+  return rs.rowsAffected > 0;
+}
+
+/** زرع المزودين وخرائط الموديلات الافتراضية — مرة واحدة فقط عند أول تهيئة (ON CONFLICT لا يكرر) */
+async function seedProvidersAndMappings(): Promise<void> {
+  const seededProviders = [
+    {
+      id: "kie",
+      name: "Kie.ai",
+      base_url: "https://api.kie.ai",
+      auth_type: "bearer",
+      auth_header: "Authorization",
+      adapter_type: "kie",
+      image_endpoint: "/api/v1/jobs/createTask",
+      video_endpoint: "/api/v1/jobs/createTask",
+      check_endpoint: "/api/v1/jobs/recordInfo",
+    },
+    {
+      id: "cometapi",
+      name: "CometAPI",
+      base_url: "https://api.cometapi.com",
+      auth_type: "bearer",
+      auth_header: "Authorization",
+      adapter_type: "cometapi",
+      image_endpoint: "/v1/images/generations",
+      video_endpoint: "/v1/videos/generations",
+      check_endpoint: "/v1/videos/{task_id}",
+    },
+  ];
+  for (const p of seededProviders) {
+    await getTurso().execute({
+      sql: `INSERT INTO providers (id, name, base_url, auth_type, auth_header, adapter_type, image_endpoint, video_endpoint, check_endpoint, enabled, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(id) DO NOTHING`,
+      args: [p.id, p.name, p.base_url, p.auth_type, p.auth_header, p.adapter_type, p.image_endpoint, p.video_endpoint, p.check_endpoint, nowIso()],
+    });
+  }
+
+  const seededMappings = [
+    // gpt-image-2-6/flare-text-to-image — صور
+    { canonical: "gpt-image-2-6/flare-text-to-image", type: "image", provider_id: "kie", provider_model_name: "gpt-image-2-6/flare-text-to-image", priority: 1 },
+    { canonical: "gpt-image-2-6/flare-text-to-image", type: "image", provider_id: "cometapi", provider_model_name: "gpt-image-2.6-flare-text-to-image", priority: 2 },
+    // grok-imagine-video-1-5-preview — فيديو
+    { canonical: "grok-imagine-video-1-5-preview", type: "video", provider_id: "kie", provider_model_name: "grok-imagine-video-1-5-preview", priority: 1 },
+    { canonical: "grok-imagine-video-1-5-preview", type: "video", provider_id: "cometapi", provider_model_name: "grok-imagine-video-1-5-preview", priority: 2 },
+  ];
+  for (const m of seededMappings) {
+    await getTurso().execute({
+      sql: `INSERT INTO model_mappings (canonical, type, provider_id, provider_model_name, default_params_json, priority, enabled, created_at)
+            SELECT ?, ?, ?, ?, NULL, ?, 1, ?
+            WHERE NOT EXISTS (
+              SELECT 1 FROM model_mappings WHERE canonical = ? AND type = ? AND provider_id = ?
+            )`,
+      args: [m.canonical, m.type, m.provider_id, m.provider_model_name, m.priority, nowIso(), m.canonical, m.type, m.provider_id],
+    });
+  }
 }

@@ -9,13 +9,13 @@ import {
   findDuplicateKey,
   rememberApiName,
   listApiNames,
+  getProviderById,
   toSafeKey,
 } from "@/lib/turso";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const PROTOCOLS = new Set(["kie", "cometapi"]);
 const CAPABILITIES = new Set(["both", "image", "video"]);
 
 export async function GET() {
@@ -40,7 +40,7 @@ export async function POST(req: NextRequest) {
   const apiKey = String(body.api_key ?? "").trim();
   const label = String(body.label ?? "").trim();
   const capability = String(body.capability ?? "both").trim() || "both";
-  // البروتوكول يُستنتج من الاسم إن لم يُرسل (comet → cometapi وإلا kie)
+  // معرّف المزود (protocol) يُستنتج من الاسم إن لم يُرسل (comet → cometapi وإلا kie)
   const protocol = String(body.protocol ?? "").trim() || (/comet/i.test(provider) ? "cometapi" : "kie");
 
   if (!provider) {
@@ -49,8 +49,13 @@ export async function POST(req: NextRequest) {
   if (provider.length > 60) {
     return Response.json({ error: "اسم الـ API طويل جدًا (الحد 60 حرفًا)" }, { status: 400 });
   }
-  if (!PROTOCOLS.has(protocol)) {
-    return Response.json({ error: "بروتوكول الاتصال يجب أن يكون kie أو cometapi" }, { status: 400 });
+  // المزود يجب أن يكون موجودًا في جدول providers — أضف مزودك من إدارة المزودين (بلا Hardcoding)
+  const providerRow = await getProviderById(protocol);
+  if (!providerRow) {
+    return Response.json(
+      { error: `المزود «${protocol}» غير موجود — أضفه أولًا من «إدارة المزودين» أو اختر مزودًا قائمًا` },
+      { status: 400 },
+    );
   }
   if (!CAPABILITIES.has(capability)) {
     return Response.json({ error: "استخدام المفتاح يجب أن يكون: both (صور وفيديو) أو image (صور فقط) أو video (فيديو فقط)" }, { status: 400 });

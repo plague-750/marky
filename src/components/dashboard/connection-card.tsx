@@ -16,12 +16,13 @@ import { copyText, type HealthResponse } from "./shared";
 const TOOLS: Array<{ name: string; desc: string }> = [
   { name: "generate_image", desc: "توليد صورة من وصف نصي" },
   { name: "generate_video", desc: "توليد فيديو مع صوت متزامن أصلي" },
-  { name: "merge_videos", desc: "دمج عدة مقاطع في فيديو واحد بالترتيب المعطى" },
-  { name: "get_task", desc: "متابعة حالة أي مهمة بمعرّفها" },
+  { name: "merge_videos", desc: "دمج عدة مقاطع (2-10) في فيديو واحد — يُحذف الناتج بعد ~24 ساعة" },
+  { name: "get_task", desc: "متابعة حالة أي مهمة بمعرّفها (حد أقصى 600 ثانية للصور و1800 للفيديو)" },
   { name: "list_media", desc: "استرجاع أحدث الوسائط المخزنة بروابطها" },
+  { name: "retry_task", desc: "إعادة محاولة مهمة عالقة أو فاشلة فورًا — اختياريًا على مزود محدد" },
 ];
 
-/** البطاقة (ج): ربط السيرفر — رابط MCP + إعدادات العملاء + الأدوات الخمس. */
+/** البطاقة (هـ): ربط السيرفر — رابط MCP + إعدادات العملاء + الأدوات الست. */
 export function ConnectionCard({ health, className }: { health: HealthResponse | null; className?: string }) {
   const { toast } = useToast();
   const [mcpUrl, setMcpUrl] = React.useState<string | null>(null);
@@ -168,9 +169,9 @@ export function ConnectionCard({ health, className }: { health: HealthResponse |
 
         <Separator />
 
-        {/* الأدوات الخمس */}
+        {/* الأدوات الست */}
         <div className="flex flex-col gap-2">
-          <h3 className="text-sm font-semibold">الأدوات الخمس</h3>
+          <h3 className="text-sm font-semibold">الأدوات الست</h3>
           <ul className="flex flex-col gap-2">
             {TOOLS.map((tool) => (
               <li

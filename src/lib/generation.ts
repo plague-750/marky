@@ -12,7 +12,7 @@ import {
   parseTs,
   type TaskRow,
 } from "./turso";
-import { getAdapter } from "./providers";
+import { resolveProvider } from "./providers";
 import { ProviderError, classifyProviderError, isKeyOrBalanceFailure, scrubSecrets } from "./errors";
 import { normalizeModel, IMAGE_MODEL, VIDEO_MODEL, type ModelDef } from "./models";
 import type { GenInput } from "./providers/types";
@@ -41,9 +41,10 @@ interface CreateAttemptResult {
  * أول نجاح يربط المهمة بالمزود والمفتاح؛ كل محاولة تُسجَّل في attempts_json
  * وعدّادات المفتاح تُحدَّث دائمًا. خطأ معطيات = توقف فوري.
  */
-async function attemptCreation(taskId: string, model: ModelDef, input: GenInput): Promise<CreateAttemptResult> {
+async function attemptCreation(taskId: string, model: ModelDef, input: GenInput, forceProvider?: string): Promise<CreateAttemptResult> {
   // المجمع مجمّع حسب أسماء الـ API الحرّة (المجموعة الأولى ثم التالية) ومُصفّى حسب استخدام المفتاح (صور/فيديو)
-  const pool = await getKeyPoolForTask(model.type === "video" ? "video" : "image", model.providers);
+  // مزودو الموديل يأتون من جدول model_mappings حسب الأولوية — وليسوا Hardcoded. forceProvider = إجبار مزود واحد (retry_task)
+  const pool = await getKeyPoolForTask(model.type === "video" ? "video" : "image", model.providers, forceProvider);
 
   if (!pool.length) {
     // لا مفاتيح نشطة — تبقى المهمة processing وتُعاد المحاولة تلقائيًا مع كل get_task
@@ -52,12 +53,20 @@ async function attemptCreation(taskId: string, model: ModelDef, input: GenInput)
   }
 
   for (const key of pool) {
-    const adapter = getAdapter(key.protocol); // البروتوكول يحدد كيفية الاتصال — الاسم مجرد معرّف عرض
+    // إعدادات المزود الحية من جدول providers + محوله حسب adapter_type — المزود معطل/محذوف → تخطّى مفاتيحه
+    const resolved = await resolveProvider(key.protocol);
     const providerModel = model.providerModel[key.protocol];
+    if (!resolved || !providerModel) {
+      await updateTask(taskId, {
+        append_attempt: { provider: key.protocol, keyId: key.id, keyLabel: key.provider, ok: false, errorClass: "provider", error: "المزود غير مفعّل أو خريطة موديله محذوفة", at: new Date().toISOString() },
+      });
+      continue;
+    }
+    const { provider, adapter } = resolved;
     try {
       // صور متزامنة (مزود يدعمها): النتيجة فورية
       if (model.type === "image" && adapter.createImageSync) {
-        const { urls } = await adapter.createImageSync(key.api_key, providerModel, input);
+        const { urls } = await adapter.createImageSync(key.api_key, providerModel, input, provider);
         await updateTask(taskId, {
           provider: key.protocol,
           key_id: key.id,
@@ -71,7 +80,7 @@ async function attemptCreation(taskId: string, model: ModelDef, input: GenInput)
         return { kind: "sync_completed", task: task! };
       }
 
-      const { providerTaskId } = await adapter.createTask(key.api_key, providerModel, input);
+      const { providerTaskId } = await adapter.createTask(key.api_key, providerModel, input, provider);
       await updateTask(taskId, {
         provider: key.protocol,
         provider_task_id: providerTaskId,
@@ -174,8 +183,11 @@ async function checkProviderTask(task: TaskRow): Promise<
   const key = task.key_id ? await getKeyById(task.key_id) : null;
   if (!key) return { ok: false, cls: "temporary" };
   try {
-    const adapter = getAdapter(task.provider);
-    const res = await adapter.checkTask(key.api_key, task.provider_task_id);
+    // إعدادات المزود الحية من قاعدة البيانات — المزود معطل/محذوف → فشل مزود (تبديل للمفتاح/المزود التالي)
+    const resolved = await resolveProvider(task.provider);
+    if (!resolved) return { ok: false, cls: "provider" };
+    const { provider, adapter } = resolved;
+    const res = await adapter.checkTask(key.api_key, task.provider_task_id, provider);
     return { ok: true, res };
   } catch (e) {
     const cls = e instanceof ProviderError ? classifyProviderError(e.status, e.message) : "temporary";
@@ -234,8 +246,8 @@ export async function runGeneration(p: RunGenerationParams): Promise<GenOutcome>
 
     const checked = await checkProviderTask(task);
     if (!checked.ok) {
-      if (checked.cls === "disabled" || checked.cls === "exhausted") {
-        // فشل مفتاح في منتصف المهمة — أعد الإنشاء بنفس task_id على المفتاح التالي
+      if (checked.cls === "disabled" || checked.cls === "exhausted" || checked.cls === "provider") {
+        // فشل مفتاح أو مزود في منتصف المهمة — أعد الإنشاء بنفس task_id على المفتاح التالي
         const rec = await midTaskFailover(taskId, p.model, p.input, `مفتاح ${checked.cls}`, task.key_id);
         if (rec.kind === "params_failed") return { kind: "failed", task: rec.task! };
         continue;
@@ -280,7 +292,7 @@ export async function refreshGenerationTask(task: TaskRow): Promise<TaskRow> {
 
   const checked = await checkProviderTask(task);
   if (!checked.ok) {
-    if (checked.cls === "disabled" || checked.cls === "exhausted") {
+    if (checked.cls === "disabled" || checked.cls === "exhausted" || checked.cls === "provider") {
       const rec = await midTaskFailover(task.id, model, input, `مفتاح ${checked.cls}`, task.key_id);
       if (rec.kind === "params_failed") return rec.task!;
     }
@@ -307,11 +319,12 @@ function resolveModel(task: TaskRow): ModelDef {
 const RETRY_MARKER = "إعادة إنتاج يدوية";
 
 /**
- * إعادة إنتاج مهمة صورة/فيديو يدويًا من لوحة المهام:
+ * إعادة إنتاج مهمة صورة/فيديو يدويًا من لوحة المهام أو أداة retry_task:
  * تصفير كامل للمهمة (المزود/المفتاح/النتيجة/الخطأ/التقدم) ثم محاولة إنشاء فورية
  * على مجمع المفاتيح بالترتيب التسلسلي — بنفس المعطيات الأصلية وبنفس task_id.
+ * forceProvider اختياري: إجبار المحاولة على مزود محدد بمعرّفه (قسم 5 من المواصفة).
  */
-export async function retryGenerationTask(taskId: string): Promise<TaskRow | null> {
+export async function retryGenerationTask(taskId: string, forceProvider?: string): Promise<TaskRow | null> {
   const task = await getTask(taskId);
   if (!task || (task.type !== "image" && task.type !== "video")) return null;
 
@@ -327,7 +340,7 @@ export async function retryGenerationTask(taskId: string): Promise<TaskRow | nul
   const input: GenInput = params.input ?? { prompt: task.prompt };
   const model = resolveModel(task);
 
-  // إنشاء فوري — يتخطى تهدئة 45 ثانية لأنها إعادة إنتاج يدوية مقصودة
-  await attemptCreation(taskId, model, input);
+  // إنشاء فوري — يتخطى تهدئة 45 ثانية لأنها إعادة إنتاج مقصودة، مع إمكانية إجبار المزود
+  await attemptCreation(taskId, model, input, forceProvider);
   return getTask(taskId);
 }

@@ -44,12 +44,21 @@ import {
   formatRelativeAr,
   groupKeysByName,
   PROVIDER_LABELS,
+  PROVIDERS_CHANGED_EVENT,
   type ApiKey,
   type ApiName,
   type KeyCapability,
   type KeysResponse,
   type ProviderId,
+  type ProviderRow,
+  type ProvidersResponse,
 } from "./shared";
+
+/** خيارات طريقة الاتصال الاحتياطية عند تعذر تحميل قائمة المزودين من السيرفر */
+const DEFAULT_PROTOCOL_OPTIONS: ProviderRow[] = [
+  { id: "kie", name: "kie.ai", base_url: "https://api.kie.ai", auth_type: "bearer", auth_header: "Authorization", adapter_type: "kie", image_endpoint: "", video_endpoint: "", check_endpoint: "", enabled: 1, created_at: "" },
+  { id: "cometapi", name: "CometAPI", base_url: "https://api.cometapi.com", auth_type: "bearer", auth_header: "Authorization", adapter_type: "cometapi", image_endpoint: "", video_endpoint: "", check_endpoint: "", enabled: 1, created_at: "" },
+];
 
 const STATUS_META: Record<ApiKey["status"], { label: string; badgeClass: string }> = {
   active: { label: "نشط", badgeClass: "border-emerald-500/30 bg-emerald-500/15 text-emerald-300" },
@@ -116,10 +125,11 @@ export function KeyManager({ className }: { className?: string }) {
 
   const [keys, setKeys] = React.useState<ApiKey[] | null>(null);
   const [names, setNames] = React.useState<ApiName[]>([]);
+  const [providers, setProviders] = React.useState<ProviderRow[] | null>(null);
   const [loadFailed, setLoadFailed] = React.useState(false);
 
   const [apiName, setApiName] = React.useState("");
-  const [protocol, setProtocol] = React.useState<ProviderId>("kie");
+  const [protocol, setProtocol] = React.useState<string>("kie");
   const [capability, setCapability] = React.useState<KeyCapability>("both");
   const [apiKey, setApiKey] = React.useState("");
   const [adding, setAdding] = React.useState(false);
@@ -142,10 +152,27 @@ export function KeyManager({ className }: { className?: string }) {
     } catch {
       setLoadFailed(true);
     }
+    // قائمة المزودين (طريقة الاتصال) ديناميكية من قاعدة البيانات — فشلها لا يمنع المفاتيح
+    try {
+      const pRes = await fetch("/api/providers", { cache: "no-store" });
+      if (pRes.ok) {
+        const pData = (await pRes.json()) as ProvidersResponse;
+        setProviders(Array.isArray(pData.providers) ? pData.providers : []);
+      }
+    } catch {
+      // اترك null — تستخدم الخيارات الاحتياطية
+    }
   }, []);
 
   React.useEffect(() => {
     void loadKeys();
+  }, [loadKeys]);
+
+  // تحديث فوري لقائمة «طريقة الاتصال» عند إضافة/تعديل مزود من «إدارة المزودين»
+  React.useEffect(() => {
+    const handler = () => void loadKeys();
+    window.addEventListener(PROVIDERS_CHANGED_EVENT, handler);
+    return () => window.removeEventListener(PROVIDERS_CHANGED_EVENT, handler);
   }, [loadKeys]);
 
   const handleNameChange = (value: string) => {
@@ -156,14 +183,14 @@ export function KeyManager({ className }: { className?: string }) {
       return;
     }
     if (manualProtocol.current) return;
-    // 1) الاسم المحفوظ مسبقًا يأخذ بروتوكوله المحفوظ  2) وإلا الاستنتاج من الكلمات المفتاحية
+    // 1) الاسم المحفوظ مسبقًا يأخذ مزوده المحفوظ  2) وإلا الاستنتاج من الكلمات المفتاحية
     const saved = names.find((n) => n.name.toLowerCase() === value.trim().toLowerCase());
     const detected = detectProtocolFromName(value);
-    if (saved && (saved.protocol === "kie" || saved.protocol === "cometapi")) setProtocol(saved.protocol);
+    if (saved && saved.protocol) setProtocol(saved.protocol);
     else if (detected) setProtocol(detected);
   };
 
-  const handleProtocolChange = (v: ProviderId) => {
+  const handleProtocolChange = (v: string) => {
     manualProtocol.current = true;
     setProtocol(v);
   };
@@ -333,8 +360,11 @@ export function KeyManager({ className }: { className?: string }) {
                   <SelectValue placeholder="الطريقة" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="kie">kie.ai</SelectItem>
-                  <SelectItem value="cometapi">CometAPI</SelectItem>
+                  {(providers ?? DEFAULT_PROTOCOL_OPTIONS).map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {PROVIDER_LABELS[p.id] ?? p.name}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
@@ -456,7 +486,7 @@ export function KeyManager({ className }: { className?: string }) {
       </CardContent>
 
       {/* حوار تعديل الاسم/الطريقة/الاستخدام */}
-      <EditKeyDialog apiKey={editingKey} onClose={() => setEditingKey(null)} onSaved={handleEdited} />
+      <EditKeyDialog apiKey={editingKey} providers={providers} onClose={() => setEditingKey(null)} onSaved={handleEdited} />
     </Card>
   );
 }
@@ -469,7 +499,7 @@ function ProtocolHint({
   names,
 }: {
   apiName: string;
-  protocol: ProviderId;
+  protocol: string;
   names: ApiName[];
 }) {
   const name = apiName.trim();
@@ -487,7 +517,7 @@ function ProtocolHint({
   const saved = names.find((n) => n.name.toLowerCase() === name.toLowerCase());
   const detected = detectProtocolFromName(name);
 
-  if (saved && (saved.protocol === "kie" || saved.protocol === "cometapi")) {
+  if (saved && saved.protocol) {
     return (
       <p className="text-[11px] leading-relaxed text-emerald-300/90">
         ✓ الاسم «{name}» محفوظ — طريقة الاتصال {PROVIDER_LABELS[saved.protocol] ?? saved.protocol} (المحفوظة سابقًا)
@@ -651,16 +681,18 @@ function KeyRow({
 
 function EditKeyDialog({
   apiKey: key,
+  providers,
   onClose,
   onSaved,
 }: {
   apiKey: ApiKey | null;
+  providers: ProviderRow[] | null;
   onClose: () => void;
   onSaved: (updated: ApiKey) => void;
 }) {
   const { toast } = useToast();
   const [name, setName] = React.useState("");
-  const [protocol, setProtocol] = React.useState<ProviderId>("kie");
+  const [protocol, setProtocol] = React.useState<string>("kie");
   const [capability, setCapability] = React.useState<KeyCapability>("both");
   const [saving, setSaving] = React.useState(false);
   const initializedFor = React.useRef<string | null>(null);
@@ -668,7 +700,7 @@ function EditKeyDialog({
   React.useEffect(() => {
     if (key && initializedFor.current !== key.id) {
       setName(key.provider ?? "");
-      setProtocol(key.protocol === "cometapi" ? "cometapi" : "kie");
+      setProtocol(key.protocol || "kie");
       setCapability(key.capability === "image" ? "image" : key.capability === "video" ? "video" : "both");
       initializedFor.current = key.id;
     }
@@ -733,13 +765,16 @@ function EditKeyDialog({
           </div>
           <div className="flex flex-col gap-1.5">
             <label className="text-xs font-medium text-muted-foreground">طريقة الاتصال (حسب موقع المفتاح)</label>
-            <Select value={protocol} onValueChange={(v) => setProtocol(v as ProviderId)}>
+            <Select value={protocol} onValueChange={(v) => setProtocol(v)}>
               <SelectTrigger aria-label="طريقة الاتصال" className="h-11 w-full data-[size=default]:h-11">
                 <SelectValue placeholder="الطريقة" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="kie">kie.ai</SelectItem>
-                <SelectItem value="cometapi">CometAPI</SelectItem>
+                {(providers ?? DEFAULT_PROTOCOL_OPTIONS).map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {PROVIDER_LABELS[p.id] ?? p.name}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>

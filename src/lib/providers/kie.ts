@@ -1,21 +1,40 @@
 // مزود kie.ai — Jobs API الموحد (الأشكال المقاسة فعليًا بتاريخ التنفيذ، لا اختراع حقول)
+// الإعدادات (base_url + نقاط النهاية) تأتي من جدول providers مع قيم افتراضية عند الفراغ
 import { ProviderError } from "../errors";
-import { type ProviderAdapter, type ProviderCheckResult, type GenInput } from "./types";
+import { buildAuth, type ProviderAdapter, type ProviderCheckResult, type GenInput, type ProviderRuntime } from "./types";
 
-const BASE = "https://api.kie.ai/api/v1/jobs";
+const DEFAULT_BASE = "https://api.kie.ai";
+const DEFAULT_CREATE_EP = "/api/v1/jobs/createTask";
+const DEFAULT_CHECK_EP = "/api/v1/jobs/recordInfo";
+
+function createUrl(provider: ProviderRuntime): string {
+  const base = (provider.base_url || DEFAULT_BASE).replace(/\/$/, "");
+  const ep = provider.image_endpoint || provider.video_endpoint || DEFAULT_CREATE_EP;
+  return `${base}${ep.startsWith("/") ? "" : "/"}${ep}`;
+}
+
+function checkUrl(provider: ProviderRuntime, providerTaskId: string): string {
+  const base = (provider.base_url || DEFAULT_BASE).replace(/\/$/, "");
+  const ep = provider.check_endpoint || DEFAULT_CHECK_EP;
+  const path = `${ep.startsWith("/") ? "" : "/"}${ep}`;
+  // دعم {task_id} كعنصر نائب أو الإضافة كمعامل استعلام taskId
+  if (path.includes("{task_id}")) return `${base}${path.replace("{task_id}", encodeURIComponent(providerTaskId))}`;
+  return `${base}${path}${path.includes("?") ? "&" : "?"}taskId=${encodeURIComponent(providerTaskId)}`;
+}
 
 /**
  * نداء موحد: ملاحظة مقاسة — kie قد يعيد HTTP 200 مع `code` خطأ داخل الجسم
  * (مثل مفتاح خاطئ: {"code":401,"msg":"Unauthorized ..."} بحالة HTTP 200)
  * لذلك نعتمد body.code كحالة فعالة إن وُجد ولم يكن 200.
  */
-async function kieRequest(apiKey: string, url: string, init?: RequestInit): Promise<unknown> {
+async function kieRequest(provider: ProviderRuntime, apiKey: string, url: string, init?: RequestInit): Promise<unknown> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 30_000);
+  const { headers } = buildAuth(provider, apiKey);
   try {
     const res = await fetch(url, {
       ...init,
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", ...(init?.headers || {}) },
+      headers: { ...headers, "Content-Type": "application/json", ...(init?.headers || {}) },
       signal: ctrl.signal,
     });
     let body: { code?: number; msg?: string; message?: string; data?: unknown } | null = null;
@@ -27,7 +46,7 @@ async function kieRequest(apiKey: string, url: string, init?: RequestInit): Prom
     const bodyCode = typeof body?.code === "number" ? body.code : null;
     const effectiveStatus = bodyCode !== null && bodyCode !== 200 ? bodyCode : res.status;
     if (!res.ok || (bodyCode !== null && bodyCode !== 200)) {
-      throw new ProviderError("kie", effectiveStatus, body?.msg || body?.message || `HTTP ${res.status}`);
+      throw new ProviderError(provider.id, effectiveStatus, body?.msg || body?.message || `HTTP ${res.status}`);
     }
     return body?.data ?? body;
   } finally {
@@ -48,21 +67,18 @@ function buildInput(input: GenInput): Record<string, unknown> {
 }
 
 export const kieAdapter: ProviderAdapter = {
-  async createTask(apiKey, providerModel, input) {
-    const data = (await kieRequest(apiKey, `${BASE}/createTask`, {
+  async createTask(apiKey, providerModel, input, provider) {
+    const data = (await kieRequest(provider, apiKey, createUrl(provider), {
       method: "POST",
       body: JSON.stringify({ model: providerModel, input: buildInput(input) }),
     })) as { taskId?: string; recordId?: string } | undefined;
     const taskId = data?.taskId || data?.recordId;
-    if (!taskId) throw new ProviderError("kie", 500, "استجابة إنشاء مهمة بلا معرّف");
+    if (!taskId) throw new ProviderError(provider.id, 500, "استجابة إنشاء مهمة بلا معرّف");
     return { providerTaskId: String(taskId) };
   },
 
-  async checkTask(apiKey, providerTaskId): Promise<ProviderCheckResult> {
-    const data = (await kieRequest(
-      apiKey,
-      `${BASE}/recordInfo?taskId=${encodeURIComponent(providerTaskId)}`,
-    )) as {
+  async checkTask(apiKey, providerTaskId, provider): Promise<ProviderCheckResult> {
+    const data = (await kieRequest(provider, apiKey, checkUrl(provider, providerTaskId))) as {
       state?: string;
       resultJson?: string | Record<string, unknown>;
       failMsg?: string | null;

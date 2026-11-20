@@ -1,17 +1,38 @@
 // مزود CometAPI — صور متزامنة عبر نقطة images المتوافقة مع OpenAI، وفيديو عبر نقطة مهام غير متزامنة
 // تنفيذ دفاعي وفق التوثيق العام: أي اختلاف في الشكل يُصنَّف كخطأ مزود وينتقل التبديل إلى المفتاح/المزود التالي
+// الإعدادات (base_url + نقاط النهاية) تأتي من جدول providers مع قيم افتراضية عند الفراغ
 import { ProviderError } from "../errors";
-import { type ProviderAdapter, type ProviderCheckResult, type GenInput } from "./types";
+import { buildAuth, type ProviderAdapter, type ProviderCheckResult, type GenInput, type ProviderRuntime } from "./types";
 
-const BASE = "https://api.cometapi.com";
+const DEFAULT_BASE = "https://api.cometapi.com";
+const DEFAULT_IMAGE_EP = "/v1/images/generations";
+const DEFAULT_VIDEO_EP = "/v1/videos/generations";
+const DEFAULT_CHECK_EP = "/v1/videos/{task_id}";
 
-async function cometRequest(apiKey: string, path: string, init?: RequestInit): Promise<Record<string, unknown>> {
+function submitUrl(provider: ProviderRuntime, kind: "image" | "video"): string {
+  const base = (provider.base_url || DEFAULT_BASE).replace(/\/$/, "");
+  const ep = kind === "image" ? provider.image_endpoint || DEFAULT_IMAGE_EP : provider.video_endpoint || DEFAULT_VIDEO_EP;
+  return `${base}${ep.startsWith("/") ? "" : "/"}${ep}`;
+}
+
+function checkUrl(provider: ProviderRuntime, providerTaskId: string): string {
+  const base = (provider.base_url || DEFAULT_BASE).replace(/\/$/, "");
+  const ep = provider.check_endpoint || DEFAULT_CHECK_EP;
+  const path = `${ep.startsWith("/") ? "" : "/"}${ep}`;
+  // دعم {task_id} كعنصر نائب، وإلا الإضافة كمسار، وإلا كمعامل استعلام task_id
+  if (path.includes("{task_id}")) return `${base}${path.replace("{task_id}", encodeURIComponent(providerTaskId))}`;
+  if (path.includes("?")) return `${base}${path}&task_id=${encodeURIComponent(providerTaskId)}`;
+  return `${base}${path}/${encodeURIComponent(providerTaskId)}`;
+}
+
+async function cometRequest(provider: ProviderRuntime, apiKey: string, url: string, init?: RequestInit): Promise<Record<string, unknown>> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 30_000);
+  const { headers } = buildAuth(provider, apiKey);
   try {
-    const res = await fetch(`${BASE}${path}`, {
+    const res = await fetch(url, {
       ...init,
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", ...(init?.headers || {}) },
+      headers: { ...headers, "Content-Type": "application/json", ...(init?.headers || {}) },
       signal: ctrl.signal,
     });
     let body: Record<string, unknown> | null = null;
@@ -25,7 +46,7 @@ async function cometRequest(apiKey: string, path: string, init?: RequestInit): P
         ((body?.error as { message?: string } | undefined)?.message) ||
         (body?.message as string | undefined) ||
         `HTTP ${res.status}`;
-      throw new ProviderError("cometapi", res.status, msg);
+      throw new ProviderError(provider.id, res.status, msg);
     }
     return body ?? {};
   } finally {
@@ -73,8 +94,8 @@ const FAILED_RE = /^(failed|failure|error|cancelled|canceled)$/i;
 
 export const cometapiAdapter: ProviderAdapter = {
   // صور متزامنة: تُعيد الرابط/b64_json فورًا
-  async createImageSync(apiKey, providerModel, input: GenInput) {
-    const body = await cometRequest(apiKey, "/v1/images/generations", {
+  async createImageSync(apiKey, providerModel, input, provider) {
+    const body = await cometRequest(provider, apiKey, submitUrl(provider, "image"), {
       method: "POST",
       body: JSON.stringify({
         model: providerModel,
@@ -93,12 +114,12 @@ export const cometapiAdapter: ProviderAdapter = {
         return null;
       })
       .filter((u): u is string => !!u);
-    if (!urls.length) throw new ProviderError("cometapi", 500, "استجابة توليد صور بلا روابط");
+    if (!urls.length) throw new ProviderError(provider.id, 500, "استجابة توليد صور بلا روابط");
     return { urls };
   },
 
-  async createTask(apiKey, providerModel, input: GenInput) {
-    const body = await cometRequest(apiKey, "/v1/videos/generations", {
+  async createTask(apiKey, providerModel, input, provider) {
+    const body = await cometRequest(provider, apiKey, submitUrl(provider, "video"), {
       method: "POST",
       body: JSON.stringify({
         model: providerModel,
@@ -111,12 +132,12 @@ export const cometapiAdapter: ProviderAdapter = {
       }),
     });
     const taskId = extractTaskId(body);
-    if (!taskId) throw new ProviderError("cometapi", 500, "استجابة إنشاء مهمة فيديو بلا معرّف");
+    if (!taskId) throw new ProviderError(provider.id, 500, "استجابة إنشاء مهمة فيديو بلا معرّف");
     return { providerTaskId: taskId };
   },
 
-  async checkTask(apiKey, providerTaskId): Promise<ProviderCheckResult> {
-    const body = await cometRequest(apiKey, `/v1/videos/${encodeURIComponent(providerTaskId)}`);
+  async checkTask(apiKey, providerTaskId, provider): Promise<ProviderCheckResult> {
+    const body = await cometRequest(provider, apiKey, checkUrl(provider, providerTaskId));
     const status = String(body?.status ?? "").toLowerCase();
     if (FAILED_RE.test(status)) {
       const err = (body?.error as { message?: string } | undefined)?.message || (body?.error as string | undefined) || "فشل المزود دون تفاصيل";

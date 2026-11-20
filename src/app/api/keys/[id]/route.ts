@@ -1,6 +1,6 @@
 // PATCH/DELETE /api/keys/{id} — تعطيل/تنشيط يدوي وحذف + تعديل اسم الـ API/البروتوكول (قسم 4.4)
 import { NextRequest } from "next/server";
-import { ensureSchema, patchKey, deleteKey, rememberApiName, toSafeKey } from "@/lib/turso";
+import { ensureSchema, patchKey, deleteKey, rememberApiName, getProviderById, toSafeKey } from "@/lib/turso";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -30,8 +30,13 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
   }
   if (body.protocol !== undefined) {
     const protocol = String(body.protocol).trim();
-    if (protocol !== "kie" && protocol !== "cometapi") {
-      return Response.json({ error: "بروتوكول الاتصال يجب أن يكون kie أو cometapi" }, { status: 400 });
+    // المزود يجب أن يكون موجودًا في جدول providers — بلا Hardcoding
+    const providerRow = await getProviderById(protocol);
+    if (!providerRow) {
+      return Response.json(
+        { error: `المزود «${protocol}» غير موجود — أضفه أولًا من «إدارة المزودين»` },
+        { status: 400 },
+      );
     }
     patch.protocol = protocol;
   }

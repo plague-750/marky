@@ -1,15 +1,16 @@
 // خادم MCP — مسار /mcp بنقل Streamable HTTP حسب مواصفة MCP (قسم 8)
-// SDK رسمي: Server + StreamableHTTPServerTransport — لا JSON-RPC يدوي.
-// الأدوات الخمس بمخططات JSON مطابقة للبرومبت؛ نتائج الاستدعاء تُصاغ بالعربية.
+// SDK رسمي: Server + WebStandardStreamableHTTPServerTransport — لا JSON-RPC يدوي.
+// الأدوات الست بمخططات JSON مطابقة للبرومبت (قسم 5)؛ نتائج الاستدعاء تُصاغ بالعربية.
+// قوائم الموديلات تُقرأ ديناميكيًا من جدول model_mappings — ليست Hardcoded.
 import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { IMAGE_MODEL, VIDEO_MODEL, normalizeModel } from "@/lib/models";
-import { runGeneration } from "@/lib/generation";
-import { runMerge } from "@/lib/merge";
+import { IMAGE_MODEL, VIDEO_MODEL, resolveModel, listDynamicModels } from "@/lib/models";
+import { runGeneration, retryGenerationTask } from "@/lib/generation";
+import { runMerge, retryMergeTask } from "@/lib/merge";
 import { refreshTask } from "@/lib/refresh";
-import { listRecentTasks } from "@/lib/turso";
+import { getTask, listRecentTasks, parseUrls } from "@/lib/turso";
 import { RuleError } from "@/lib/errors";
 import {
   fmtImageDone,
@@ -25,116 +26,143 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const SERVER_INFO = { name: "media-generator-mcp", version: "1.2.0" } as const;
+const SERVER_INFO = { name: "media-generator-mcp", version: "2.0.0" } as const;
 
 // تعليمات تُرسل مع initialize لتوجيه سلوك النموذج المستدعي
-const SERVER_INSTRUCTIONS = `AI media generation server (kie.ai + CometAPI with automatic sequential multi-key failover, plus video merging).
+const SERVER_INSTRUCTIONS = `AI media generation server (dynamic providers from database — kie.ai, CometAPI and any provider you add — with automatic sequential multi-key failover, plus video merging).
 Workflow: call generate_image or generate_video. If the response contains finished URLs, show them to the user.
 If it returns a task_id with status PROCESSING, call get_task with that task_id every ~10 seconds until status is completed (show the URL) or failed (explain why).
 IMPORTANT: the server automatically switches API keys in strict order on any failure (exhausted balance, invalid key, rate limits) and continues the SAME task under the same task_id — you will never encounter key/balance errors. Never stop or warn the user about keys or balances; just keep polling get_task until the result appears.
 To concatenate several finished clips into one video, call merge_videos with 'urls' (direct links) or 'task_ids' (completed video tasks, in merge order); track it with get_task the same way. Note: the merged file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly.
+If a task stays stuck or fails, call retry_task with its task_id (optionally force_provider) to re-run it instantly.
 Use list_media to recall previously generated media from the database.`;
 
-// ----------------------------- مخططات الأدوات الخمس -----------------------------
+// ----------------------------- مخططات الأدوات الست -----------------------------
 
 const IMAGE_ASPECTS = ["auto", "1:1", "3:2", "2:3", "4:3", "3:4", "5:4", "4:5", "16:9", "9:16", "2:1", "1:2", "21:9", "9:21", "3:1", "1:3"];
 const VIDEO_ASPECTS = ["auto", "1:1", "16:9", "9:16", "3:2", "2:3"];
 
-const TOOLS = [
-  {
-    name: "generate_image",
-    description:
-      "Generate an image with gpt-image-2-6/flare-text-to-image (automatic failover across all active API keys). Returns the finished image URL if it completes within the wait window; otherwise returns a task_id — then call get_task every ~10 seconds until completed, show the URL, and stop.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        prompt: { type: "string", minLength: 1, description: "What to draw. Detailed prompts give better results." },
-        model: {
-          type: "string",
-          enum: ["gpt-image-2-6/flare-text-to-image", "gpt-image-2.6/flare-text-to-image"],
-          default: "gpt-image-2-6/flare-text-to-image",
+interface ToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+/** بناء قائمة الأدوات — أسماء الموديلات من جدول model_mappings مع الاحتياط الثابت عند تعذر القاعدة */
+async function buildTools(): Promise<ToolDef[]> {
+  let imageModels = [IMAGE_MODEL.canonical];
+  let videoModels = [VIDEO_MODEL.canonical];
+  try {
+    const dyn = await listDynamicModels();
+    const dynImages = dyn.filter((m) => m.type === "image").map((m) => m.canonical);
+    const dynVideos = dyn.filter((m) => m.type === "video").map((m) => m.canonical);
+    if (dynImages.length) imageModels = dynImages;
+    if (dynVideos.length) videoModels = dynVideos;
+  } catch {
+    // الاحتياط الثابت
+  }
+
+  return [
+    {
+      name: "generate_image",
+      description:
+        "Generate an image (automatic failover across all active API keys, providers resolved dynamically from the database). Returns the finished image URL if it completes within the wait window; otherwise returns a task_id — then call get_task every ~10 seconds until completed, show the URL, and stop.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", minLength: 1, description: "What to draw. Detailed prompts give better results." },
+          model: { type: "string", enum: imageModels, default: imageModels[0] },
+          aspect_ratio: { type: "string", enum: IMAGE_ASPECTS, default: "auto" },
+          resolution: { type: "string", enum: ["1K", "2K", "4K"], default: "1K" },
+          background: { type: "string", enum: ["auto", "transparent", "opaque"], default: "auto", description: "Only applied at 1K." },
+          output_format: { type: "string", enum: ["png", "jpeg", "webp", "gif"], default: "png" },
+          wait_seconds: { type: "integer", minimum: 0, maximum: 240, default: 90 },
         },
-        aspect_ratio: { type: "string", enum: IMAGE_ASPECTS, default: "auto" },
-        resolution: { type: "string", enum: ["1K", "2K", "4K"], default: "1K" },
-        background: { type: "string", enum: ["auto", "transparent", "opaque"], default: "auto", description: "Only applied at 1K." },
-        output_format: { type: "string", enum: ["png", "jpeg", "webp", "gif"], default: "png" },
-        wait_seconds: { type: "integer", minimum: 0, maximum: 240, default: 90 },
-      },
-      required: ["prompt"],
-    },
-  },
-  {
-    name: "generate_video",
-    description:
-      "Generate a video with grok-imagine-video-1-5-preview (native synchronized audio: dialogue/SFX/music; optional image-to-video). Videos take minutes: a short wait with live progress streaming is attempted, then a task_id is returned — track it with get_task every ~10 seconds.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        prompt: { type: "string", maxLength: 4096, description: "Scene description. Dialogue in the prompt is spoken in the video." },
-        image_url: { type: "string", description: "Optional public image URL as the first frame (image-to-video)." },
-        model: {
-          type: "string",
-          enum: ["grok-imagine-video-1-5-preview", "grok-imagine-video-1.5-preview"],
-          default: "grok-imagine-video-1-5-preview",
-        },
-        aspect_ratio: { type: "string", enum: VIDEO_ASPECTS, default: "auto" },
-        resolution: { type: "string", enum: ["480p", "720p", "1080p"], default: "480p" },
-        enable_audio: { type: "boolean", default: true },
-        duration: { type: "integer", minimum: 1, maximum: 15, default: 8, description: "Duration in seconds." },
-        wait_seconds: { type: "integer", minimum: 0, maximum: 240, default: 25 },
-      },
-      required: ["prompt"],
-    },
-  },
-  {
-    name: "merge_videos",
-    description:
-      "Merge several clips into ONE final video in the given order. Pass 'urls' (public direct video links — e.g. generate_video results) or 'task_ids' (completed video tasks; their result URLs are resolved from the database in this order). Merging is usually quick: a short wait with live progress is attempted, then a merge task_id is returned — track it with get_task. IMPORTANT: the merged file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        urls: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 2,
-          maxItems: 10,
-          description: "Public direct video URLs (http/https) in merge order — the first clip starts the final video.",
-        },
-        task_ids: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 2,
-          maxItems: 10,
-          description: "Alternative to urls: task_ids of COMPLETED video generation tasks — their result URLs are merged in this order.",
-        },
-        wait_seconds: { type: "integer", minimum: 0, maximum: 240, default: 60 },
+        required: ["prompt"],
       },
     },
-  },
-  {
-    name: "get_task",
-    description:
-      "Track any task by its id — image/video generation AND merging (reads the database and refreshes live from the provider/merging service while still running). Poll it every ~10 seconds; when completed you will find the result URLs — show them to the user and stop polling.",
-    inputSchema: {
-      type: "object",
-      properties: { task_id: { type: "string" } },
-      required: ["task_id"],
-    },
-  },
-  {
-    name: "list_media",
-    description:
-      "List the latest stored images/videos/merges with their URLs from the database (no re-generation) — for recalling previous results.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        type: { type: "string", enum: ["image", "video", "merge"] },
-        status: { type: "string", enum: ["completed", "failed", "processing"] },
-        limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
+    {
+      name: "generate_video",
+      description:
+        "Generate a video with synchronized audio (optional image-to-video). Videos take minutes: a short wait with live progress streaming is attempted, then a task_id is returned — track it with get_task every ~10 seconds.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", maxLength: 4096, description: "Scene description. Dialogue in the prompt is spoken in the video." },
+          image_url: { type: "string", description: "Optional public image URL as the first frame (image-to-video)." },
+          model: { type: "string", enum: videoModels, default: videoModels[0] },
+          aspect_ratio: { type: "string", enum: VIDEO_ASPECTS, default: "auto" },
+          resolution: { type: "string", enum: ["480p", "720p", "1080p"], default: "480p" },
+          enable_audio: { type: "boolean", default: true },
+          duration: { type: "integer", minimum: 1, maximum: 15, default: 8, description: "Duration in seconds." },
+          wait_seconds: { type: "integer", minimum: 0, maximum: 240, default: 25 },
+        },
+        required: ["prompt"],
       },
     },
-  },
-];
+    {
+      name: "merge_videos",
+      description:
+        "Merge several clips into ONE final video in the given order. Pass 'urls' (public direct video links — e.g. generate_video results) or 'task_ids' (completed video tasks; their result URLs are resolved from the database in this order). Merging is usually quick: a short wait with live progress is attempted, then a merge task_id is returned — track it with get_task. IMPORTANT: the merged file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          urls: {
+            type: "array",
+            items: { type: "string" },
+            minItems: 2,
+            maxItems: 10,
+            description: "Public direct video URLs (http/https) in merge order — the first clip starts the final video.",
+          },
+          task_ids: {
+            type: "array",
+            items: { type: "string" },
+            minItems: 2,
+            maxItems: 10,
+            description: "Alternative to urls: task_ids of COMPLETED video generation tasks — their result URLs are merged in this order.",
+          },
+          wait_seconds: { type: "integer", minimum: 0, maximum: 240, default: 60 },
+        },
+      },
+    },
+    {
+      name: "get_task",
+      description:
+        "Track any task by its id — image/video generation AND merging (reads the database and refreshes live from the provider/merging service while still running). Tasks exceeding their maximum duration (600s images, 1800s videos) turn failed automatically. Poll it every ~10 seconds; when completed you will find the result URLs — show them to the user and stop polling.",
+      inputSchema: {
+        type: "object",
+        properties: { task_id: { type: "string" } },
+        required: ["task_id"],
+      },
+    },
+    {
+      name: "list_media",
+      description:
+        "List the latest stored images/videos/merges with their URLs from the database (no re-generation) — for recalling previous results.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: { type: "string", enum: ["image", "video", "merge"] },
+          status: { type: "string", enum: ["completed", "failed", "processing"] },
+          limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
+        },
+      },
+    },
+    {
+      name: "retry_task",
+      description:
+        "Re-run a stuck or failed task instantly (6th tool): resets it (status=processing, clears provider binding and result) and re-submits it with the SAME original inputs and SAME task_id, trying all keys sequentially. Inputs: task_id (required); force_provider (optional) to force one specific provider by its id (e.g. 'kie' or 'cometapi' or a custom provider id). Works for image, video and merge tasks.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          task_id: { type: "string", description: "معرّف المهمة العالقة أو الفاشلة" },
+          force_provider: { type: "string", description: "اختياري — إجبار المحاولة على مزود محدد بمعرّفه (مثل kie أو cometapi أو مزود أضفته بنفسك)" },
+        },
+        required: ["task_id"],
+      },
+    },
+  ];
+}
 
 // ----------------------------- أدوات مساعدة -----------------------------
 
@@ -168,11 +196,22 @@ function makeProgressSender(extra: { sendNotification: (n: unknown) => Promise<v
   };
 }
 
-
 function outcomeToResult(kind: "completed" | "processing" | "failed", task: import("@/lib/turso").TaskRow) {
   if (kind === "completed") return textResult(fmtTaskDone(task));
   if (kind === "failed") return textResult(fmtFailed(task.error_message || "سبب غير معروف"), true);
   return textResult(fmtProcessing(task));
+}
+
+/** قائمة الموديلات المتاحة لرسالة الخطأ — من القاعدة مع الاحتياط */
+async function availableModelsText(type: "image" | "video"): Promise<string> {
+  try {
+    const dyn = await listDynamicModels();
+    const list = dyn.filter((m) => m.type === type).map((m) => m.canonical);
+    if (list.length) return list.join(" ، ");
+  } catch {
+    // احتياط ثابت
+  }
+  return type === "image" ? IMAGE_MODEL.canonical : VIDEO_MODEL.canonical;
 }
 
 // ----------------------------- منطق الأدوات -----------------------------
@@ -183,9 +222,9 @@ async function callTool(name: string, args: Record<string, unknown>, extra: Tool
       const prompt = String(args.prompt ?? "").trim();
       if (!prompt) return textResult("❌ المعطى prompt مطلوب لتوليد الصورة.", true);
       const modelInput = args.model ? String(args.model) : IMAGE_MODEL.canonical;
-      const model = normalizeModel(modelInput);
+      const model = await resolveModel(modelInput);
       if (!model || model.type !== "image") {
-        return textResult(`❌ موديل غير معروف: ${modelInput}. المتاح للصور: ${IMAGE_MODEL.canonical}`, true);
+        return textResult(`❌ موديل غير معروف أو غير مفعّل: ${modelInput}. المتاح للصور: ${await availableModelsText("image")}`, true);
       }
       const outcome = await runGeneration({
         type: "image",
@@ -209,9 +248,9 @@ async function callTool(name: string, args: Record<string, unknown>, extra: Tool
       if (!prompt) return textResult("❌ المعطى prompt مطلوب لتوليد الفيديو.", true);
       if (prompt.length > 4096) return textResult("❌ طول الوصف يتجاوز 4096 حرفًا.", true);
       const modelInput = args.model ? String(args.model) : VIDEO_MODEL.canonical;
-      const model = normalizeModel(modelInput);
+      const model = await resolveModel(modelInput);
       if (!model || model.type !== "video") {
-        return textResult(`❌ موديل غير معروف: ${modelInput}. المتاح للفيديو: ${VIDEO_MODEL.canonical}`, true);
+        return textResult(`❌ موديل غير معروف أو غير مفعّل: ${modelInput}. المتاح للفيديو: ${await availableModelsText("video")}`, true);
       }
       const imageUrl = typeof args.image_url === "string" && /^https?:\/\//i.test(args.image_url) ? args.image_url : undefined;
       const outcome = await runGeneration({
@@ -269,9 +308,39 @@ async function callTool(name: string, args: Record<string, unknown>, extra: Tool
       return textResult(`📋 أحدث الوسائط المخزنة (${tasks.length}):\n\n${lines.join("\n\n")}`);
     }
 
+    case "retry_task": {
+      // الأداة السادسة (قسم 5): إعادة محاولة مهمة عالقة أو فاشلة فورًا — اختياريًا على مزود محدد
+      const taskId = String(args.task_id ?? "").trim();
+      if (!taskId) return textResult("❌ المعطى task_id مطلوب لإعادة المحاولة.", true);
+      const forceProvider = typeof args.force_provider === "string" && args.force_provider.trim() ? args.force_provider.trim() : undefined;
+      const task = await getTask(taskId);
+      if (!task) return textResult(`❌ لا توجد مهمة بهذا المعرّف: ${taskId}`, true);
+
+      if (task.type === "merge") {
+        const updated = await retryMergeTask(taskId);
+        if (!updated) return textResult("❌ تعذّرت إعادة محاولة مهمة الدمج.", true);
+        if (updated.status === "completed") return textResult(fmtMergeDone(parseUrls(updated.result_urls_json)));
+        if (updated.status === "failed") return textResult(fmtFailed(updated.error_message || "سبب غير معروف"), true);
+        return textResult(fmtProcessing(updated));
+      }
+      if (task.type !== "image" && task.type !== "video") {
+        return textResult(`❌ نوع المهمة «${task.type}» غير قابل لإعادة المحاولة.`, true);
+      }
+      const updated = await retryGenerationTask(taskId, forceProvider);
+      if (!updated) return textResult("❌ تعذّرت إعادة محاولة المهمة.", true);
+      if (updated.status === "completed") {
+        const urls = parseUrls(updated.result_urls_json);
+        if (updated.type === "image" && urls.length) return textResult(fmtImageDone(urls));
+        if (updated.type === "video" && urls.length) return textResult(fmtVideoDone(urls));
+      }
+      if (updated.status === "failed") return textResult(fmtFailed(updated.error_message || "سبب غير معروف"), true);
+      const forcedNote = forceProvider ? `\n\n(مُجبرة على المزود: ${forceProvider})` : "";
+      return textResult(`🔄 أُعيدت إنتاج المهمة بنفس المعطيات وهي الآن قيد المعالجة.\n\n${fmtProcessing(updated)}${forcedNote}`);
+    }
+
     default:
       return textResult(
-        `❌ أداة غير معروفة: ${name}. المتاح: generate_image، generate_video، merge_videos، get_task، list_media`,
+        `❌ أداة غير معروفة: ${name}. المتاح: generate_image، generate_video، merge_videos، get_task، list_media، retry_task`,
         true,
       );
   }
@@ -299,7 +368,7 @@ function createServer(): Server {
     capabilities: { tools: {} },
   });
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await buildTools() }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const name = String(req.params.name ?? "");
