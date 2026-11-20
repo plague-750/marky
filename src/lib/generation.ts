@@ -8,6 +8,7 @@ import {
   updateTask,
   bumpKeyStats,
   markKeyStatus,
+  resetTaskForRetry,
   parseTs,
   type TaskRow,
 } from "./turso";
@@ -50,19 +51,19 @@ async function attemptCreation(taskId: string, model: ModelDef, input: GenInput)
   }
 
   for (const key of pool) {
-    const adapter = getAdapter(key.provider);
-    const providerModel = model.providerModel[key.provider];
+    const adapter = getAdapter(key.protocol); // البروتوكول يحدد كيفية الاتصال — الاسم مجرد معرّف عرض
+    const providerModel = model.providerModel[key.protocol];
     try {
       // صور متزامنة (مزود يدعمها): النتيجة فورية
       if (model.type === "image" && adapter.createImageSync) {
         const { urls } = await adapter.createImageSync(key.api_key, providerModel, input);
         await updateTask(taskId, {
-          provider: key.provider,
+          provider: key.protocol,
           key_id: key.id,
           status: "completed",
           progress: 100,
           result_urls_json: JSON.stringify(urls),
-          append_attempt: { provider: key.provider, keyId: key.id, keyLabel: key.label, ok: true, at: new Date().toISOString() },
+          append_attempt: { provider: key.protocol, keyId: key.id, keyLabel: key.provider, ok: true, at: new Date().toISOString() },
         });
         await bumpKeyStats(key.id, true);
         const task = await getTask(taskId);
@@ -71,13 +72,13 @@ async function attemptCreation(taskId: string, model: ModelDef, input: GenInput)
 
       const { providerTaskId } = await adapter.createTask(key.api_key, providerModel, input);
       await updateTask(taskId, {
-        provider: key.provider,
+        provider: key.protocol,
         provider_task_id: providerTaskId,
         key_id: key.id,
         status: "processing",
         progress: 5,
         error_message: null,
-        append_attempt: { provider: key.provider, keyId: key.id, keyLabel: key.label, ok: true, at: new Date().toISOString() },
+        append_attempt: { provider: key.protocol, keyId: key.id, keyLabel: key.provider, ok: true, at: new Date().toISOString() },
       });
       await bumpKeyStats(key.id, true);
       return { kind: "created" };
@@ -89,7 +90,7 @@ async function attemptCreation(taskId: string, model: ModelDef, input: GenInput)
       if (cls === "disabled") await markKeyStatus(key.id, "disabled", safeMsg);
       if (cls === "exhausted") await markKeyStatus(key.id, "exhausted", safeMsg);
       await updateTask(taskId, {
-        append_attempt: { provider: key.provider, keyId: key.id, keyLabel: key.label, ok: false, errorClass: cls, error: safeMsg, at: new Date().toISOString() },
+        append_attempt: { provider: key.protocol, keyId: key.id, keyLabel: key.provider, ok: false, errorClass: cls, error: safeMsg, at: new Date().toISOString() },
       });
       if (cls === "params") {
         // توقف فورًا — تبديل المفاتيح لن يحل خطأ معطيات
@@ -300,4 +301,32 @@ function safeParseParams(json: string): { input?: GenInput; wait_seconds?: numbe
 /** استرجاع تعريف الموديل من اسمه المخزَّن — مع الاحتياط لنوع المهمة */
 function resolveModel(task: TaskRow): ModelDef {
   return normalizeModel(task.model) ?? (task.type === "video" ? VIDEO_MODEL : IMAGE_MODEL);
+}
+
+const RETRY_MARKER = "إعادة إنتاج يدوية";
+
+/**
+ * إعادة إنتاج مهمة صورة/فيديو يدويًا من لوحة المهام:
+ * تصفير كامل للمهمة (المزود/المفتاح/النتيجة/الخطأ/التقدم) ثم محاولة إنشاء فورية
+ * على مجمع المفاتيح بالترتيب التسلسلي — بنفس المعطيات الأصلية وبنفس task_id.
+ */
+export async function retryGenerationTask(taskId: string): Promise<TaskRow | null> {
+  const task = await getTask(taskId);
+  if (!task || (task.type !== "image" && task.type !== "video")) return null;
+
+  await resetTaskForRetry(taskId, {
+    provider: "retry",
+    keyId: "",
+    keyLabel: RETRY_MARKER,
+    ok: true,
+    at: new Date().toISOString(),
+  });
+
+  const params = safeParseParams(task.params_json);
+  const input: GenInput = params.input ?? { prompt: task.prompt };
+  const model = resolveModel(task);
+
+  // إنشاء فوري — يتخطى تهدئة 45 ثانية لأنها إعادة إنتاج يدوية مقصودة
+  await attemptCreation(taskId, model, input);
+  return getTask(taskId);
 }

@@ -28,7 +28,8 @@ export interface HealthResponse {
 
 export interface ApiKey {
   id: string;
-  provider: string;
+  provider: string; // اسم الـ API الحر الذي كتبه المستخدم
+  protocol: string; // بروتوكول الاتصال: kie | cometapi
   label: string | null;
   status: "active" | "exhausted" | "disabled";
   usage_count: number;
@@ -39,6 +40,17 @@ export interface ApiKey {
   last_error: string | null;
   created_at: string;
   masked_key: string;
+}
+
+export interface ApiName {
+  name: string;
+  protocol: string;
+  updated_at: string;
+}
+
+export interface KeysResponse {
+  keys: ApiKey[];
+  names: ApiName[];
 }
 
 export type TaskType = "image" | "video" | "merge";
@@ -75,7 +87,7 @@ export interface TasksResponse {
   tasks: Task[];
 }
 
-/* ------------------------- تسميات المزودين ------------------------- */
+/* ------------------------- تسميات البروتوكولات ------------------------- */
 
 export const PROVIDER_LABELS: Record<string, string> = {
   kie: "kie.ai",

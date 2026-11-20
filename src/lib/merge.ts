@@ -4,6 +4,7 @@ import {
   getTask,
   insertTask,
   updateTask,
+  resetTaskForRetry,
   parseTs,
   parseUrls,
   type TaskRow,
@@ -266,4 +267,45 @@ function safeParams(json: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+const RETRY_MARKER = "إعادة إنتاج يدوية";
+
+/**
+ * إعادة إنتاج مهمة دمج يدويًا من لوحة المهام:
+ * تصفير كامل للمهمة ثم إنشاء مهمة دمج جديدة فورًا لدى الخدمة بنفس مقاطع المصادر
+ * (الروابط تُخزَّن في params_json.videos) وإطلاق المعالجة من جديد بنفس task_id.
+ */
+export async function retryMergeTask(taskId: string): Promise<TaskRow | null> {
+  const task = await getTask(taskId);
+  if (!task || task.type !== "merge") return null;
+
+  const videos = (safeParams(task.params_json).videos as string[] | undefined) ?? [];
+  await resetTaskForRetry(taskId, {
+    provider: "retry",
+    keyId: "",
+    keyLabel: RETRY_MARKER,
+    ok: true,
+    at: new Date().toISOString(),
+  });
+
+  if (videos.length < 2) {
+    await updateTask(taskId, { status: "failed", error_message: MSG_NEED_TWO });
+    return getTask(taskId);
+  }
+
+  // صفّر علامة بدء المعالجة حتى يُطلق POST /process من جديد للمهمة الجديدة
+  const cur = safeParams((await getTask(taskId))?.params_json ?? "{}");
+  await updateTask(taskId, { params_json: JSON.stringify({ ...cur, processStarted: false }) });
+
+  try {
+    const job = await mergerCreateJob(videos);
+    await updateTask(taskId, { provider_task_id: job.jobId, status: "processing", progress: 5, error_message: null });
+    await ensureProcessStarted(taskId);
+  } catch (e) {
+    // فشل وصول للخدمة — تبقى processing وتُعاد المحاولة تلقائيًا مع الاستقصاء بعد التهدئة
+    const msg = e instanceof Error ? e.message : String(e);
+    await updateTask(taskId, { status: "processing", error_message: `بانتظار خدمة الدمج… (${msg.slice(0, 120)})` });
+  }
+  return getTask(taskId);
 }

@@ -7,16 +7,30 @@ import {
   ExternalLink,
   Image as ImageIcon,
   ListChecks,
+  Loader2,
   RefreshCw,
+  RotateCcw,
   TriangleAlert,
   Video,
 } from "lucide-react";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { formatRelativeAr, toAbsoluteUrl, type Task, type TaskStatus, type TaskType, type TasksResponse } from "./shared";
 
@@ -33,12 +47,21 @@ const STATUS_META: Record<TaskStatus, { label: string; badgeClass: string }> = {
   pending: { label: "جارية", badgeClass: "border-violet-500/30 bg-violet-500/15 text-violet-300" },
 };
 
-/** البطاقة (ب): لوحة المهام — إحصائيات + قائمة حية تُحدَّث كل 5 ثوانٍ. */
+/** مهلة اعتبار المهمة الجارية «عالقة» — بلا تحديث منذ دقيقة */
+const STUCK_MS = 60_000;
+
+interface ApiErrorBody {
+  error?: string;
+}
+
+/** البطاقة (ب): لوحة المهام — إحصائيات + قائمة حية تُحدَّث كل 5 ثوانٍ + إعادة إنتاج لأي مهمة. */
 export function TaskBoard({ className }: { className?: string }) {
+  const { toast } = useToast();
   const [data, setData] = React.useState<TasksResponse | null>(null);
   const [initialLoading, setInitialLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
   const [failed, setFailed] = React.useState(false);
+  const [retryBusyId, setRetryBusyId] = React.useState<string | null>(null);
 
   const load = React.useCallback(async (manual: boolean) => {
     if (manual) setRefreshing(true);
@@ -62,6 +85,35 @@ export function TaskBoard({ className }: { className?: string }) {
     return () => clearInterval(id);
   }, [load]);
 
+  /** إعادة إنتاج مهمة — نفس المعطيات الأصلية وبنفس معرّف المهمة */
+  const handleRetry = React.useCallback(
+    async (task: Task) => {
+      setRetryBusyId(task.id);
+      try {
+        const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/retry`, { method: "POST" });
+        if (!res.ok) {
+          const body = (await res.json().catch(() => null)) as ApiErrorBody | null;
+          toast({
+            title: "تعذّرت إعادة الإنتاج",
+            description: body?.error ?? "حاول مجددًا",
+            variant: "destructive",
+          });
+          return;
+        }
+        toast({
+          title: "بدأت إعادة الإنتاج",
+          description: "المهمة عادت للمعالجة بنفس المعطيات — تابع تقدمها هنا",
+        });
+        await load(false);
+      } catch {
+        toast({ title: "تعذّر الاتصال بالسيرفر", description: "حاول مجددًا", variant: "destructive" });
+      } finally {
+        setRetryBusyId(null);
+      }
+    },
+    [load, toast],
+  );
+
   const stats = data?.stats;
 
   return (
@@ -71,7 +123,9 @@ export function TaskBoard({ className }: { className?: string }) {
           <ListChecks className="size-5 text-teal-400" aria-hidden />
           لوحة المهام
         </CardTitle>
-        <CardDescription>أحدث 20 مهمة مع حالتها وتقدمها — تحديث تلقائي كل 5 ثوانٍ.</CardDescription>
+        <CardDescription>
+          أحدث 20 مهمة مع حالتها وتقدمها — تحديث تلقائي كل 5 ثوانٍ، ويمكنك إعادة إنتاج أي مهمة فاشلة أو عالقة بضغطة.
+        </CardDescription>
         <CardAction>
           <Button
             variant="outline"
@@ -140,7 +194,12 @@ export function TaskBoard({ className }: { className?: string }) {
           <div className="scrollbar-thin max-h-96 overflow-y-auto pe-1">
             <ul className="flex flex-col gap-2">
               {data.tasks.map((task) => (
-                <TaskRow key={task.id} task={task} />
+                <TaskRow
+                  key={task.id}
+                  task={task}
+                  retryBusy={retryBusyId === task.id}
+                  onRetry={() => void handleRetry(task)}
+                />
               ))}
             </ul>
           </div>
@@ -175,15 +234,47 @@ function StatChip({
 
 /* -------------------------------- صف مهمة -------------------------------- */
 
-function TaskRow({ task }: { task: Task }) {
+function TaskRow({
+  task,
+  retryBusy,
+  onRetry,
+}: {
+  task: Task;
+  retryBusy: boolean;
+  onRetry: () => void;
+}) {
   const typeMeta = TYPE_META[task.type] ?? TYPE_META.video;
   const statusMeta = STATUS_META[task.status] ?? STATUS_META.pending;
   const isRunning = task.status === "processing" || task.status === "pending";
   const TypeIcon = typeMeta.icon;
   const progress = Math.max(0, Math.min(100, Math.round(task.progress ?? 0)));
 
+  // مؤشر التعليق — يُحسب بعد التحميل فقط تفاديًا لاختلاف الترطيب (hydration)
+  const [now, setNow] = React.useState<number | null>(null);
+  React.useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(id);
+  }, []);
+  const isStuck =
+    now !== null && isRunning && now - new Date(task.updated_at).getTime() > STUCK_MS;
+
+  const confirmTitle =
+    task.status === "completed"
+      ? "إعادة إنتاج مهمة مكتملة؟"
+      : "إعادة إنتاج مهمة جارية؟";
+  const confirmBody =
+    task.status === "completed"
+      ? "هذه المهمة مكتملة بالفعل — إعادة الإنتاج ستبدأ محاولة جديدة بنفس الإعدادات وتستبدل الناتج الحالي."
+      : "المهمة ما زالت قيد المعالجة — إعادة الإنتاج ستلغي المحاولة الحالية وتبدأ من جديد بنفس الإعدادات.";
+
   return (
-    <li className="rounded-lg border bg-muted/20 p-3 transition-colors hover:border-teal-500/40">
+    <li
+      className={cn(
+        "rounded-lg border bg-muted/20 p-3 transition-colors hover:border-teal-500/40",
+        isStuck && "border-amber-500/40",
+      )}
+    >
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
         <span
           className={cn(
@@ -217,6 +308,13 @@ function TaskRow({ task }: { task: Task }) {
           aria-label={`تقدم المهمة ${progress}%`}
           className="mt-2.5 h-1.5 [&_[data-slot=progress-indicator]]:bg-violet-500"
         />
+      ) : null}
+
+      {isStuck ? (
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-amber-300">
+          <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
+          بلا تحديث منذ وقت طويل — جرّب «إعادة إنتاج» إن استمر التوقف.
+        </p>
       ) : null}
 
       {task.status === "completed" && task.result_urls.length > 0 ? (
@@ -263,7 +361,7 @@ function TaskRow({ task }: { task: Task }) {
         </p>
       ) : null}
 
-      <div className="mt-2 flex items-center gap-3 text-xs text-muted-foreground">
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground">
         <span>المحاولات: {task.attempts_count ?? task.attempts.length ?? 0}</span>
         {task.attempts.length > 0 ? (
           <details className="min-w-0 flex-1">
@@ -288,6 +386,54 @@ function TaskRow({ task }: { task: Task }) {
             </ul>
           </details>
         ) : null}
+
+        {/* زر إعادة الإنتاج — فوري للمهام الفاشلة، وبتأكيد للجارية/المكتملة */}
+        {task.status === "failed" ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-11 shrink-0 border-rose-500/40 text-rose-200 hover:bg-rose-500/10 hover:text-rose-100"
+            disabled={retryBusy}
+            onClick={onRetry}
+            aria-label={`إعادة إنتاج المهمة الفاشلة ${task.id}`}
+          >
+            {retryBusy ? (
+              <Loader2 className="size-4 animate-spin" aria-hidden />
+            ) : (
+              <RotateCcw className="size-4" aria-hidden />
+            )}
+            إعادة إنتاج
+          </Button>
+        ) : (
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-11 shrink-0"
+                disabled={retryBusy}
+                aria-label={`إعادة إنتاج المهمة ${task.id}`}
+              >
+                {retryBusy ? (
+                  <Loader2 className="size-4 animate-spin" aria-hidden />
+                ) : (
+                  <RotateCcw className="size-4" aria-hidden />
+                )}
+                إعادة إنتاج
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>{confirmTitle}</AlertDialogTitle>
+                <AlertDialogDescription>{confirmBody}</AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>إلغاء</AlertDialogCancel>
+                <AlertDialogAction onClick={onRetry}>نعم، أعد الإنتاج</AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        )}
       </div>
     </li>
   );

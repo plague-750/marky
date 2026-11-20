@@ -7,10 +7,13 @@ let _schemaPromise: Promise<void> | null = null;
 
 export function getTurso(): Client {
   if (!_client) {
-    _client = createClient({
-      url: process.env.TURSO_DATABASE_URL!,
-      authToken: process.env.TURSO_AUTH_TOKEN!,
-    });
+    // سلسلة الاحتياط: TURSO_DATABASE_URL (سحابي) ← DATABASE_URL (ملف محلي) ← مسار افتراضي
+    const url =
+      process.env.TURSO_DATABASE_URL ||
+      process.env.DATABASE_URL ||
+      "file:/home/z/my-project/db/custom.db";
+    const authToken = process.env.TURSO_AUTH_TOKEN || undefined;
+    _client = authToken ? createClient({ url, authToken }) : createClient({ url });
   }
   return _client;
 }
@@ -68,8 +71,9 @@ export interface TaskRow {
 
 export interface KeyRow {
   id: string;
-  provider: string;
-  label: string;
+  provider: string; // اسم الـ API الحر الذي كتبه المستخدم (يُحفظ كما كُتب)
+  protocol: string; // بروتوكول الاتصال: kie | cometapi — يحدد كيفية التحدث مع الـ API
+  label: string; // للتوافق القديم — لم يعد يُستخدم
   api_key: string;
   status: string; // active | exhausted | disabled
   usage_count: number;
@@ -79,6 +83,12 @@ export interface KeyRow {
   last_checked_at: string | null;
   last_error: string | null;
   created_at: string;
+}
+
+export interface ApiNameRow {
+  name: string;
+  protocol: string;
+  updated_at: string;
 }
 
 export type SafeKey = Omit<KeyRow, "api_key"> & { masked_key: string };
@@ -101,6 +111,12 @@ export function parseUrls(json: string | null | undefined): string[] {
 // ----------------------------- المخطط -----------------------------
 
 const SCHEMA_SQL = [
+  `CREATE TABLE IF NOT EXISTS api_names (
+  name TEXT PRIMARY KEY,
+  protocol TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+)`,
   `CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   provider TEXT,
@@ -122,6 +138,7 @@ const SCHEMA_SQL = [
   `CREATE TABLE IF NOT EXISTS api_keys (
   id TEXT PRIMARY KEY,
   provider TEXT NOT NULL,
+  protocol TEXT DEFAULT '',
   label TEXT DEFAULT '',
   api_key TEXT NOT NULL,
   status TEXT DEFAULT 'active',
@@ -139,6 +156,7 @@ export async function ensureSchema(): Promise<void> {
   if (!_schemaPromise) {
     _schemaPromise = (async () => {
       for (const sql of SCHEMA_SQL) await getTurso().execute(sql);
+      await migrateSchema();
       await seedKeyIfEmpty();
     })().catch((e) => {
       // اترك المحاولة للتكرار القادم عند فشل عابر
@@ -158,6 +176,18 @@ export async function dbHealthy(): Promise<boolean> {
   }
 }
 
+/** ترحيلات تفاضلية — تُنفَّذ مرة واحدة عند أول وصول لكل عملية */
+async function migrateSchema(): Promise<void> {
+  // عمود protocol لجدول api_keys (لقواعد البيانات القديمة المنشأة قبله)
+  const info = await getTurso().execute("PRAGMA table_info(api_keys)");
+  const cols = info.rows.map((r) => String((r as Record<string, unknown>).name ?? ""));
+  if (!cols.includes("protocol")) {
+    await getTurso().execute("ALTER TABLE api_keys ADD COLUMN protocol TEXT DEFAULT ''");
+  }
+  // المفاتيح القديمة: بروتوكولها = مزوّدها (كانا متطابقين قبل الأسماء الحرة)
+  await getTurso().execute("UPDATE api_keys SET protocol = provider WHERE protocol IS NULL OR protocol = ''");
+}
+
 /** زرع مفتاح kie.ai المزوَّد تلقائيًا فقط إذا كان جدول المفاتيح فارغًا */
 async function seedKeyIfEmpty(): Promise<void> {
   const seed = process.env.SEED_KIE_API_KEY;
@@ -165,7 +195,7 @@ async function seedKeyIfEmpty(): Promise<void> {
   const rs = await getTurso().execute("SELECT COUNT(*) AS c FROM api_keys");
   const count = Number((rs.rows[0] as Record<string, unknown> | undefined)?.c ?? 0);
   if (count > 0) return;
-  await insertKey("kie", seed, process.env.SEED_KIE_LABEL || "");
+  await insertKey("kie", seed, process.env.SEED_KIE_LABEL || "", "kie");
 }
 
 // ----------------------------- المهام -----------------------------
@@ -321,6 +351,7 @@ function rowToKey(r: Record<string, unknown>): KeyRow {
   return {
     id: String(r.id ?? ""),
     provider: String(r.provider ?? ""),
+    protocol: String(r.protocol ?? "") || "kie",
     label: String(r.label ?? ""),
     api_key: String(r.api_key ?? ""),
     status: String(r.status ?? "active"),
@@ -335,16 +366,18 @@ function rowToKey(r: Record<string, unknown>): KeyRow {
 }
 
 /**
- * جلب مجمع المفاتيح بمزودات محددة — الترتيب التسلسلي الصارم بترتيب الإضافة
+ * جلب مجمع المفاتيح بالبروتوكولات المطلوبة — الترتيب التسلسلي الصارم بترتيب الإضافة
  * (أول مفتاح أُضيف يُجرَّب أولًا) — ليس round-robin وليس الأقل استخدامًا أولًا.
  * المستنزف (exhausted) يبقى في المجموعة ولا يُستبعد؛ الاستثناء الوحيد disabled.
+ * ملاحظة: المطابقة بالبروتوكول (kie/cometapi) وليس باسم الـ API الحر — فكل الأسماء
+ * التي تستخدم نفس البروتوكول تشارك في نفس مجمع التجربة التسلسلية.
  */
-export async function getKeyPool(providers: string[]): Promise<KeyRow[]> {
-  if (!providers.length) return [];
-  const placeholders = providers.map(() => "?").join(", ");
+export async function getKeyPool(protocols: string[]): Promise<KeyRow[]> {
+  if (!protocols.length) return [];
+  const placeholders = protocols.map(() => "?").join(", ");
   const rs = await getTurso().execute({
-    sql: `SELECT * FROM api_keys WHERE status != 'disabled' AND provider IN (${placeholders}) ORDER BY created_at ASC, id ASC`,
-    args: providers,
+    sql: `SELECT * FROM api_keys WHERE status != 'disabled' AND protocol IN (${placeholders}) ORDER BY created_at ASC, id ASC`,
+    args: protocols,
   });
   return rs.rows.map((r) => rowToKey(r as Record<string, unknown>));
 }
@@ -360,13 +393,35 @@ export async function getKeyById(id: string): Promise<KeyRow | null> {
   return rowToKey(rs.rows[0] as Record<string, unknown>);
 }
 
-export async function insertKey(provider: string, apiKey: string, label: string): Promise<KeyRow> {
+export async function insertKey(provider: string, apiKey: string, label: string, protocol: string): Promise<KeyRow> {
   const id = randomUUID();
   await getTurso().execute({
-    sql: `INSERT INTO api_keys (id, provider, label, api_key, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)`,
-    args: [id, provider, label || "", apiKey, nowIso()],
+    sql: `INSERT INTO api_keys (id, provider, protocol, label, api_key, status, created_at) VALUES (?, ?, ?, ?, ?, 'active', ?)`,
+    args: [id, provider, protocol || "kie", label || "", apiKey, nowIso()],
   });
   return (await getKeyById(id))!;
+}
+
+// ----------------------------- أسماء الـ API المحفوظة -----------------------------
+
+/** حفظ اسم API حر — يُستدعى عند إضافة مفتاح أو تعديل الاسم؛ يظهر لاحقًا في الاقتراحات */
+export async function rememberApiName(name: string, protocol: string): Promise<void> {
+  await getTurso().execute({
+    sql: `INSERT INTO api_names (name, protocol, created_at, updated_at) VALUES (?, ?, ?, ?)
+          ON CONFLICT(name) DO UPDATE SET
+            updated_at = excluded.updated_at,
+            protocol = CASE WHEN excluded.protocol != '' THEN excluded.protocol ELSE api_names.protocol END`,
+    args: [name, protocol || "", nowIso(), nowIso()],
+  });
+}
+
+export async function listApiNames(): Promise<ApiNameRow[]> {
+  const rs = await getTurso().execute("SELECT name, protocol, updated_at FROM api_names ORDER BY updated_at DESC, name ASC LIMIT 50");
+  return rs.rows.map((r) => ({
+    name: String((r as Record<string, unknown>).name ?? ""),
+    protocol: String((r as Record<string, unknown>).protocol ?? ""),
+    updated_at: String((r as Record<string, unknown>).updated_at ?? ""),
+  }));
 }
 
 export async function findDuplicateKey(provider: string, apiKey: string): Promise<KeyRow | null> {
@@ -378,7 +433,10 @@ export async function findDuplicateKey(provider: string, apiKey: string): Promis
   return rowToKey(rs.rows[0] as Record<string, unknown>);
 }
 
-export async function patchKey(id: string, patch: { status?: string; label?: string }): Promise<KeyRow | null> {
+export async function patchKey(
+  id: string,
+  patch: { status?: string; label?: string; provider?: string; protocol?: string },
+): Promise<KeyRow | null> {
   const sets: string[] = [];
   const args: InValue[] = [];
   if (patch.status !== undefined) {
@@ -388,6 +446,14 @@ export async function patchKey(id: string, patch: { status?: string; label?: str
   if (patch.label !== undefined) {
     sets.push("label = ?");
     args.push(patch.label);
+  }
+  if (patch.provider !== undefined) {
+    sets.push("provider = ?");
+    args.push(patch.provider);
+  }
+  if (patch.protocol !== undefined) {
+    sets.push("protocol = ?");
+    args.push(patch.protocol);
   }
   if (!sets.length) return getKeyById(id);
   await getTurso().execute({ sql: `UPDATE api_keys SET ${sets.join(", ")} WHERE id = ?`, args: [...args, id] });
@@ -404,6 +470,50 @@ export async function markKeyStatus(id: string, status: string, lastError?: stri
     sql: `UPDATE api_keys SET status = ?, last_checked_at = ?, last_error = COALESCE(?, last_error) WHERE id = ?`,
     args: [status, nowIso(), lastError ?? null, id],
   });
+}
+
+/**
+ * تصفير المهمة لإعادة إنتاجها يدويًا — يحذف الربط بالمزود/المفتاح والنتيجة والخطأ
+ * ويضيف علامة «إعادة إنتاج يدوية» في سجل المحاولات، ثم يعيد قراءة المهمة.
+ */
+export async function resetTaskForRetry(id: string, marker?: Attempt): Promise<TaskRow | null> {
+  const current = await getTask(id);
+  if (!current) return null;
+  const attempts = marker ? [...current.attempts, marker] : current.attempts;
+  await getTurso().execute({
+    sql: `UPDATE tasks SET provider = '', provider_task_id = '', key_id = '', status = 'processing', progress = 0,
+          result_urls_json = NULL, error_message = NULL, completed_at = NULL, attempts_json = ?, updated_at = ?
+          WHERE id = ?`,
+    args: [JSON.stringify(attempts), nowIso(), id],
+  });
+  return getTask(id);
+}
+
+/** توحيد شكل المهمة في استجابات الـ API (لوحة المهام + إعادة الإنتاج) */
+export function serializeTask(t: TaskRow) {
+  return {
+    id: t.id,
+    provider: t.provider,
+    model: t.model,
+    type: t.type,
+    prompt: t.prompt,
+    status: t.status,
+    progress: t.progress,
+    result_urls: parseUrls(t.result_urls_json),
+    error_message: t.error_message,
+    attempts_count: t.attempts.length,
+    attempts: t.attempts.map((a) => ({
+      provider: a.provider,
+      keyLabel: a.keyLabel ?? null,
+      ok: a.ok,
+      errorClass: a.errorClass ?? null,
+      error: a.error ?? null,
+      at: a.at,
+    })),
+    created_at: t.created_at,
+    updated_at: t.updated_at,
+    completed_at: t.completed_at,
+  };
 }
 
 /**

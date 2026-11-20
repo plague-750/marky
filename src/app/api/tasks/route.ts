@@ -1,9 +1,17 @@
 // GET /api/tasks — أحدث المهام + الإحصائيات للوحة المهام (تحديث تلقائي كل ~5 ثوانٍ)
+// كما يُشغّل التحديث الذاتي: المهام الجارية التي لم تُحدَّث مؤخرًا تُستعلم حالتها
+// من المزود/خدمة الدمج خلفيًا حتى لا تبقى عالقة أبدًا حتى لو لم يستعلمها عميل MCP.
 import { NextRequest } from "next/server";
-import { ensureSchema, listRecentTasks, taskStats, parseUrls } from "@/lib/turso";
+import { ensureSchema, listRecentTasks, taskStats, parseTs, serializeTask } from "@/lib/turso";
+import { refreshTask } from "@/lib/refresh";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+/** المهام التي تجاوز عمرها منذ آخر تحديث هذا الحد تُستعلم حالتها خلفيًا */
+const STALE_MS = 15_000;
+/** أقصى عدد مهام تُحدَّث خلفيًا في كل استقصاء — حماية من الضغط على المزودين */
+const MAX_REFRESH_PER_POLL = 3;
 
 export async function GET(req: NextRequest) {
   await ensureSchema();
@@ -17,26 +25,21 @@ export async function GET(req: NextRequest) {
     taskStats(),
   ]);
 
+  // التحديث الذاتي للمهام العالقة — خلفيًا دون تعطيل الاستجابة، ونتيجتها تظهر في الاستقصاء التالي
+  const now = Date.now();
+  const stale = tasks
+    .filter(
+      (t) =>
+        (t.status === "processing" || t.status === "pending") &&
+        now - parseTs(t.updated_at) >= STALE_MS,
+    )
+    .slice(0, MAX_REFRESH_PER_POLL);
+  for (const t of stale) {
+    refreshTask(t.id).catch(() => {}); // مقصود دون await — لا يعطل الاستجابة
+  }
+
   return Response.json(
-    {
-      stats,
-      tasks: tasks.map((t) => ({
-        id: t.id,
-        provider: t.provider,
-        model: t.model,
-        type: t.type,
-        prompt: t.prompt,
-        status: t.status,
-        progress: t.progress,
-        result_urls: parseUrls(t.result_urls_json),
-        error_message: t.error_message,
-        attempts_count: t.attempts.length,
-        attempts: t.attempts.map((a) => ({ provider: a.provider, keyLabel: a.keyLabel, ok: a.ok, errorClass: a.errorClass, error: a.error, at: a.at })),
-        created_at: t.created_at,
-        updated_at: t.updated_at,
-        completed_at: t.completed_at,
-      })),
-    },
+    { stats, tasks: tasks.map(serializeTask) },
     { headers: { "Cache-Control": "no-store" } },
   );
 }
