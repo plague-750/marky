@@ -71,8 +71,9 @@ export interface TaskRow {
 
 export interface KeyRow {
   id: string;
-  provider: string; // اسم الـ API الحر الذي كتبه المستخدم (يُحفظ كما كُتب)
+  provider: string; // اسم الـ API الحر الذي كتبه المستخدم (يُحفظ كما كُتب) — المجموعة الفعلية للتجربة التسلسلية
   protocol: string; // بروتوكول الاتصال: kie | cometapi — يحدد كيفية التحدث مع الـ API
+  capability: string; // استخدام المفتاح: both (صور وفيديو) | image (صور فقط) | video (فيديو فقط)
   label: string; // للتوافق القديم — لم يعد يُستخدم
   api_key: string;
   status: string; // active | exhausted | disabled
@@ -139,6 +140,7 @@ const SCHEMA_SQL = [
   id TEXT PRIMARY KEY,
   provider TEXT NOT NULL,
   protocol TEXT DEFAULT '',
+  capability TEXT DEFAULT 'both',
   label TEXT DEFAULT '',
   api_key TEXT NOT NULL,
   status TEXT DEFAULT 'active',
@@ -184,6 +186,10 @@ async function migrateSchema(): Promise<void> {
   if (!cols.includes("protocol")) {
     await getTurso().execute("ALTER TABLE api_keys ADD COLUMN protocol TEXT DEFAULT ''");
   }
+  // عمود capability (صور فقط / فيديو فقط / صور وفيديو) لقواعد البيانات القديمة
+  if (!cols.includes("capability")) {
+    await getTurso().execute("ALTER TABLE api_keys ADD COLUMN capability TEXT DEFAULT 'both'");
+  }
   // المفاتيح القديمة: بروتوكولها = مزوّدها (كانا متطابقين قبل الأسماء الحرة)
   await getTurso().execute("UPDATE api_keys SET protocol = provider WHERE protocol IS NULL OR protocol = ''");
 }
@@ -195,7 +201,7 @@ async function seedKeyIfEmpty(): Promise<void> {
   const rs = await getTurso().execute("SELECT COUNT(*) AS c FROM api_keys");
   const count = Number((rs.rows[0] as Record<string, unknown> | undefined)?.c ?? 0);
   if (count > 0) return;
-  await insertKey("kie", seed, process.env.SEED_KIE_LABEL || "", "kie");
+  await insertKey("kie", seed, process.env.SEED_KIE_LABEL || "", "kie", "both");
 }
 
 // ----------------------------- المهام -----------------------------
@@ -347,11 +353,19 @@ export async function taskStats(): Promise<TaskStats> {
 
 // ----------------------------- المفاتيح -----------------------------
 
+const CAPABILITY_SET = new Set(["both", "image", "video"]);
+
+function normalizeCapability(v: unknown): string {
+  const s = String(v ?? "both").trim();
+  return CAPABILITY_SET.has(s) ? s : "both";
+}
+
 function rowToKey(r: Record<string, unknown>): KeyRow {
   return {
     id: String(r.id ?? ""),
     provider: String(r.provider ?? ""),
     protocol: String(r.protocol ?? "") || "kie",
+    capability: normalizeCapability(r.capability),
     label: String(r.label ?? ""),
     api_key: String(r.api_key ?? ""),
     status: String(r.status ?? "active"),
@@ -366,18 +380,25 @@ function rowToKey(r: Record<string, unknown>): KeyRow {
 }
 
 /**
- * جلب مجمع المفاتيح بالبروتوكولات المطلوبة — الترتيب التسلسلي الصارم بترتيب الإضافة
- * (أول مفتاح أُضيف يُجرَّب أولًا) — ليس round-robin وليس الأقل استخدامًا أولًا.
- * المستنزف (exhausted) يبقى في المجموعة ولا يُستبعد؛ الاستثناء الوحيد disabled.
- * ملاحظة: المطابقة بالبروتوكول (kie/cometapi) وليس باسم الـ API الحر — فكل الأسماء
- * التي تستخدم نفس البروتوكول تشارك في نفس مجمع التجربة التسلسلية.
+ * مجمع المفاتيح لمهمة توليد — مجمّع حسب أسماء الـ API الحرّة التي كتبها المستخدم:
+ * تُجرَّب مفاتيح الاسم الأول بالترتيب (1 ثم 2 ثم 3…) وعند فشلها كلها ينتقل لمجموعة الاسم التالي،
+ * وهكذا بالترتيب — الترتيب التسلسلي الصارم وليس round-robin ولا الأقل استخدامًا أولًا.
+ * ترتيب المجموعات = ترتيب أول إضافة لمفتاح تحت كل اسم (يبقى ثابتًا حتى مع الحذف لاحقًا).
+ * الأهلية: حسب «استخدام المفتاح» (both/image/video) + الحالة (المستنزف يبقى، المعطّل يُستبعد)
+ * + البروتوكول يجب أن يكون من بروتوكولات الموديل المدعومة.
  */
-export async function getKeyPool(protocols: string[]): Promise<KeyRow[]> {
+export async function getKeyPoolForTask(kind: "image" | "video", protocols: string[]): Promise<KeyRow[]> {
   if (!protocols.length) return [];
-  const placeholders = protocols.map(() => "?").join(", ");
+  const protocolPlaceholders = protocols.map(() => "?").join(", ");
   const rs = await getTurso().execute({
-    sql: `SELECT * FROM api_keys WHERE status != 'disabled' AND protocol IN (${placeholders}) ORDER BY created_at ASC, id ASC`,
-    args: protocols,
+    sql: `SELECT * FROM api_keys
+          WHERE status != 'disabled'
+            AND capability IN ('both', ?)
+            AND protocol IN (${protocolPlaceholders})
+          ORDER BY (SELECT MIN(k2.created_at) FROM api_keys k2
+                    WHERE k2.provider COLLATE NOCASE = api_keys.provider COLLATE NOCASE) ASC,
+                   created_at ASC, id ASC`,
+    args: [kind, ...protocols],
   });
   return rs.rows.map((r) => rowToKey(r as Record<string, unknown>));
 }
@@ -393,11 +414,17 @@ export async function getKeyById(id: string): Promise<KeyRow | null> {
   return rowToKey(rs.rows[0] as Record<string, unknown>);
 }
 
-export async function insertKey(provider: string, apiKey: string, label: string, protocol: string): Promise<KeyRow> {
+export async function insertKey(
+  provider: string,
+  apiKey: string,
+  label: string,
+  protocol: string,
+  capability: string = "both",
+): Promise<KeyRow> {
   const id = randomUUID();
   await getTurso().execute({
-    sql: `INSERT INTO api_keys (id, provider, protocol, label, api_key, status, created_at) VALUES (?, ?, ?, ?, ?, 'active', ?)`,
-    args: [id, provider, protocol || "kie", label || "", apiKey, nowIso()],
+    sql: `INSERT INTO api_keys (id, provider, protocol, capability, label, api_key, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+    args: [id, provider, protocol || "kie", normalizeCapability(capability), label || "", apiKey, nowIso()],
   });
   return (await getKeyById(id))!;
 }
@@ -435,7 +462,7 @@ export async function findDuplicateKey(provider: string, apiKey: string): Promis
 
 export async function patchKey(
   id: string,
-  patch: { status?: string; label?: string; provider?: string; protocol?: string },
+  patch: { status?: string; label?: string; provider?: string; protocol?: string; capability?: string },
 ): Promise<KeyRow | null> {
   const sets: string[] = [];
   const args: InValue[] = [];
@@ -454,6 +481,10 @@ export async function patchKey(
   if (patch.protocol !== undefined) {
     sets.push("protocol = ?");
     args.push(patch.protocol);
+  }
+  if (patch.capability !== undefined) {
+    sets.push("capability = ?");
+    args.push(normalizeCapability(patch.capability));
   }
   if (!sets.length) return getKeyById(id);
   await getTurso().execute({ sql: `UPDATE api_keys SET ${sets.join(", ")} WHERE id = ?`, args: [...args, id] });

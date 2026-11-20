@@ -16,6 +16,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const PROTOCOLS = new Set(["kie", "cometapi"]);
+const CAPABILITIES = new Set(["both", "image", "video"]);
 
 export async function GET() {
   await ensureSchema();
@@ -28,7 +29,7 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   await ensureSchema();
-  let body: { provider?: string; protocol?: string; api_key?: string; label?: string };
+  let body: { provider?: string; protocol?: string; api_key?: string; label?: string; capability?: string };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -38,6 +39,7 @@ export async function POST(req: NextRequest) {
   const provider = String(body.provider ?? "").trim();
   const apiKey = String(body.api_key ?? "").trim();
   const label = String(body.label ?? "").trim();
+  const capability = String(body.capability ?? "both").trim() || "both";
   // البروتوكول يُستنتج من الاسم إن لم يُرسل (comet → cometapi وإلا kie)
   const protocol = String(body.protocol ?? "").trim() || (/comet/i.test(provider) ? "cometapi" : "kie");
 
@@ -50,6 +52,9 @@ export async function POST(req: NextRequest) {
   if (!PROTOCOLS.has(protocol)) {
     return Response.json({ error: "بروتوكول الاتصال يجب أن يكون kie أو cometapi" }, { status: 400 });
   }
+  if (!CAPABILITIES.has(capability)) {
+    return Response.json({ error: "استخدام المفتاح يجب أن يكون: both (صور وفيديو) أو image (صور فقط) أو video (فيديو فقط)" }, { status: 400 });
+  }
   if (!apiKey) {
     return Response.json({ error: "المفتاح مطلوب" }, { status: 400 });
   }
@@ -60,7 +65,7 @@ export async function POST(req: NextRequest) {
     return Response.json({ error: "هذا المفتاح مضاف مسبقًا لنفس اسم الـ API — رفض التكرار" }, { status: 409 });
   }
 
-  const key = await insertKey(provider, apiKey, label, protocol);
+  const key = await insertKey(provider, apiKey, label, protocol, capability);
   // حفظ الاسم — يظهر في الاقتراحات لاحقًا حتى لو حُذفت كل مفاتيحه
   await rememberApiName(provider, protocol);
   return Response.json({ key: toSafeKey(key) }, { status: 201 });

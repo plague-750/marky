@@ -187,7 +187,8 @@ export function TaskBoard({ className }: { className?: string }) {
             <ListChecks className="size-8 text-muted-foreground/50" aria-hidden />
             <p className="text-sm font-medium">لا توجد مهام بعد</p>
             <p className="max-w-sm text-xs text-muted-foreground">
-              ابدأ التوليد من عميل MCP الخاص بك (ChatGPT أو Claude أو Cursor) وستظهر المهام هنا مباشرة.
+              ابدأ التوليد من «استوديو التوليد» بالأعلى أو من عميل MCP (ChatGPT أو Claude أو Cursor) وستظهر المهام هنا
+              مباشرة مع حالتها وتقدمها.
             </p>
           </div>
         ) : data !== null ? (

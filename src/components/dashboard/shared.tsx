@@ -8,6 +8,8 @@ import * as React from "react";
  */
 
 export type ProviderId = "kie" | "cometapi";
+/** استخدام المفتاح: صور وفيديو / صور فقط / فيديو فقط */
+export type KeyCapability = "both" | "image" | "video";
 
 /* ------------------------- أنواع الاستجابات ------------------------- */
 
@@ -28,8 +30,9 @@ export interface HealthResponse {
 
 export interface ApiKey {
   id: string;
-  provider: string; // اسم الـ API الحر الذي كتبه المستخدم
+  provider: string; // اسم الـ API الحر الذي كتبه المستخدم — المجموعة الفعلية للتجربة التسلسلية
   protocol: string; // بروتوكول الاتصال: kie | cometapi
+  capability: KeyCapability; // استخدام المفتاح: صور وفيديو / صور فقط / فيديو فقط
   label: string | null;
   status: "active" | "exhausted" | "disabled";
   usage_count: number;
@@ -55,7 +58,6 @@ export interface KeysResponse {
 
 export type TaskType = "image" | "video" | "merge";
 export type TaskStatus = "pending" | "processing" | "completed" | "failed";
-
 export interface TaskAttempt {
   provider: string;
   keyLabel: string | null;
@@ -87,12 +89,78 @@ export interface TasksResponse {
   tasks: Task[];
 }
 
-/* ------------------------- تسميات البروتوكولات ------------------------- */
+/** استجابة POST /api/generate — استوديو التوليد */
+export interface GenerateResponse {
+  outcome: "completed" | "processing" | "failed";
+  task: Task;
+}
+
+/* ------------------------- تسميات البروتوكولات والاستخدام ------------------------- */
 
 export const PROVIDER_LABELS: Record<string, string> = {
   kie: "kie.ai",
   cometapi: "CometAPI",
 };
+
+export const CAPABILITY_LABELS: Record<KeyCapability, string> = {
+  both: "صور وفيديو",
+  image: "صور فقط",
+  video: "فيديو فقط",
+};
+
+export function capabilityLabel(c: string | null | undefined): string {
+  if (c === "image") return CAPABILITY_LABELS.image;
+  if (c === "video") return CAPABILITY_LABELS.video;
+  return CAPABILITY_LABELS.both;
+}
+
+/** استنتاج البروتوكول من الاسم الحر — comet → CometAPI وkie → kie.ai وإلا null */
+export function detectProtocolFromName(name: string): ProviderId | null {
+  const n = (name || "").toLowerCase();
+  if (n.includes("comet")) return "cometapi";
+  if (n.includes("kie")) return "kie";
+  return null;
+}
+
+/* --------------------- تجميع المفاتيح حسب اسم الـ API --------------------- */
+
+export interface KeyGroup {
+  name: string; // اسم الـ API كما كتبه المستخدم (أول صيغة ظهرت)
+  protocol: string;
+  keys: ApiKey[]; // بترتيب الإضافة — الترتيب التسلسلي داخل المجموعة
+  /** ترتيب المجموعة = ترتيب أول إضافة لمفتاح تحت هذا الاسم */
+  firstAddedAt: number;
+}
+
+/**
+ * تجميع المفاتيح حسب اسم الـ API الحر الذي كتبه المستخدم — نفس منطق السيرفر:
+ * المجموعات بترتيب أول إضافة، والمفاتيح داخل كل مجموعة بترتيب الإضافة.
+ * المطابقة بالاسم غير حساسة لحالة الأحرف (تطابق منطق COLLATE NOCASE في السيرفر).
+ */
+export function groupKeysByName(keys: ApiKey[]): KeyGroup[] {
+  const groups = new Map<string, KeyGroup>();
+  const sorted = [...keys].sort((a, b) => {
+    const ta = new Date(a.created_at).getTime() || 0;
+    const tb = new Date(b.created_at).getTime() || 0;
+    return ta - tb || a.id.localeCompare(b.id);
+  });
+  for (const k of sorted) {
+    const nameKey = (k.provider || "بدون اسم").trim().toLowerCase();
+    const label = (k.provider || "بدون اسم").trim();
+    let g = groups.get(nameKey);
+    if (!g) {
+      g = {
+        name: label,
+        protocol: k.protocol,
+        keys: [],
+        firstAddedAt: new Date(k.created_at).getTime() || 0,
+      };
+      groups.set(nameKey, g);
+    }
+    g.keys.push(k);
+  }
+  return [...groups.values()].sort((a, b) => a.firstAddedAt - b.firstAddedAt);
+}
 
 /* --------------------- الوقت النسبي بالعربية --------------------- */
 

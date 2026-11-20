@@ -1,7 +1,7 @@
 // منسّق التوليد — runGeneration + refreshGenerationTask مع التبديل التسلسلي للمفاتيح «لا توقف أبدًا» (قسم 4.3 و6)
 import { randomUUID } from "node:crypto";
 import {
-  getKeyPool,
+  getKeyPoolForTask,
   getKeyById,
   getTask,
   insertTask,
@@ -42,7 +42,8 @@ interface CreateAttemptResult {
  * وعدّادات المفتاح تُحدَّث دائمًا. خطأ معطيات = توقف فوري.
  */
 async function attemptCreation(taskId: string, model: ModelDef, input: GenInput): Promise<CreateAttemptResult> {
-  const pool = await getKeyPool(model.providers);
+  // المجمع مجمّع حسب أسماء الـ API الحرّة (المجموعة الأولى ثم التالية) ومُصفّى حسب استخدام المفتاح (صور/فيديو)
+  const pool = await getKeyPoolForTask(model.type === "video" ? "video" : "image", model.providers);
 
   if (!pool.length) {
     // لا مفاتيح نشطة — تبقى المهمة processing وتُعاد المحاولة تلقائيًا مع كل get_task

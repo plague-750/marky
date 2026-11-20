@@ -1,7 +1,9 @@
 "use client";
 
 import * as React from "react";
-import { KeyRound, Loader2, Pencil, Plus, Power, RefreshCw, Trash2 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import { KeyRound, Layers, Loader2, Pencil, Plus, Power, RefreshCw, Trash2, Video } from "lucide-react";
+import { Image as ImageIcon } from "lucide-react";
 
 import {
   AlertDialog,
@@ -37,10 +39,14 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import {
+  capabilityLabel,
+  detectProtocolFromName,
   formatRelativeAr,
+  groupKeysByName,
   PROVIDER_LABELS,
   type ApiKey,
   type ApiName,
+  type KeyCapability,
   type KeysResponse,
   type ProviderId,
 } from "./shared";
@@ -57,17 +63,54 @@ interface ApiErrorBody {
   error?: string;
 }
 
-/** استنتاج البروتوكول من اسم الـ API — متطابق محفوظ أولًا ثم كلمات مفتاحية ثم الافتراضي */
-function inferProtocol(name: string, names: ApiName[], explicit?: ProviderId): ProviderId {
-  const saved = names.find((n) => n.name.toLowerCase() === name.trim().toLowerCase());
-  if (saved && (saved.protocol === "kie" || saved.protocol === "cometapi")) return saved.protocol;
-  if (explicit) return explicit;
-  const n = name.toLowerCase();
-  if (n.includes("comet")) return "cometapi";
-  return "kie";
+/* --------------------- مُنتقي استخدام المفتاح (صور/فيديو) --------------------- */
+
+const CAPABILITY_OPTIONS: { value: KeyCapability; label: string; icon: LucideIcon }[] = [
+  { value: "both", label: "صور وفيديو", icon: Layers },
+  { value: "image", label: "صور فقط", icon: ImageIcon },
+  { value: "video", label: "فيديو فقط", icon: Video },
+];
+
+function CapabilityPicker({
+  value,
+  onChange,
+  idPrefix,
+}: {
+  value: KeyCapability;
+  onChange: (v: KeyCapability) => void;
+  idPrefix: string;
+}) {
+  return (
+    <div role="radiogroup" aria-label="استخدام المفتاح — للصور أم للفيديو" className="grid grid-cols-3 gap-1.5">
+      {CAPABILITY_OPTIONS.map((opt) => {
+        const Icon = opt.icon;
+        const selected = value === opt.value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            id={`${idPrefix}-${opt.value}`}
+            onClick={() => onChange(opt.value)}
+            className={cn(
+              "flex h-11 flex-col items-center justify-center gap-0.5 rounded-md border px-1 text-[11px] font-medium transition-colors",
+              selected
+                ? "border-violet-500/50 bg-violet-500/15 text-violet-200"
+                : "border-border bg-muted/20 text-muted-foreground hover:border-violet-500/30 hover:text-foreground",
+            )}
+          >
+            <Icon className="size-4" aria-hidden />
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
-/** البطاقة (أ): إدارة مفاتيح المزودين — أسماء API حرة تُحفظ + تجربة تسلسلية بترتيب الإضافة. */
+/** البطاقة (أ): إدارة المفاتيح — تجمّع المفاتيح تحت اسم الـ API الحر الذي يكتبه المستخدم،
+ *  مع تحديد استخدام كل مفتاح (صور/فيديو) وتجربة تسلسلية داخل الاسم ثم الاسم التالي. */
 export function KeyManager({ className }: { className?: string }) {
   const { toast } = useToast();
 
@@ -77,12 +120,16 @@ export function KeyManager({ className }: { className?: string }) {
 
   const [apiName, setApiName] = React.useState("");
   const [protocol, setProtocol] = React.useState<ProviderId>("kie");
+  const [capability, setCapability] = React.useState<KeyCapability>("both");
   const [apiKey, setApiKey] = React.useState("");
   const [adding, setAdding] = React.useState(false);
 
   const [busyId, setBusyId] = React.useState<string | null>(null);
   const [deletingId, setDeletingId] = React.useState<string | null>(null);
   const [editingKey, setEditingKey] = React.useState<ApiKey | null>(null);
+
+  // اختار المستخدم البروتوكول يدويًا؟ عندئذ نتوقف عن المزامنة التلقائية مع الاسم
+  const manualProtocol = React.useRef(false);
 
   const loadKeys = React.useCallback(async () => {
     try {
@@ -103,8 +150,22 @@ export function KeyManager({ className }: { className?: string }) {
 
   const handleNameChange = (value: string) => {
     setApiName(value);
-    // مزامنة تلقائية للبروتوكول من الاسم المحفوظ أو الكلمات المفتاحية — قابل للتجاوز يدويًا
-    if (value.trim()) setProtocol(inferProtocol(value, names));
+    if (!value.trim()) {
+      // الاسم فُرغ — نعيد السماح بالمزامنة التلقائية
+      manualProtocol.current = false;
+      return;
+    }
+    if (manualProtocol.current) return;
+    // 1) الاسم المحفوظ مسبقًا يأخذ بروتوكوله المحفوظ  2) وإلا الاستنتاج من الكلمات المفتاحية
+    const saved = names.find((n) => n.name.toLowerCase() === value.trim().toLowerCase());
+    const detected = detectProtocolFromName(value);
+    if (saved && (saved.protocol === "kie" || saved.protocol === "cometapi")) setProtocol(saved.protocol);
+    else if (detected) setProtocol(detected);
+  };
+
+  const handleProtocolChange = (v: ProviderId) => {
+    manualProtocol.current = true;
+    setProtocol(v);
   };
 
   const handleAdd = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -114,7 +175,7 @@ export function KeyManager({ className }: { className?: string }) {
     if (!name) {
       toast({
         title: "اسم الـ API مطلوب",
-        description: "اكتب أي اسم تحبه للـ API — سيُحفظ تلقائيًا ويظهر في الاقتراحات لاحقًا",
+        description: "اكتب أي اسم تحبه — المفاتيح تتجمّع تحت هذا الاسم ويُحفظ تلقائيًا",
         variant: "destructive",
       });
       return;
@@ -132,15 +193,15 @@ export function KeyManager({ className }: { className?: string }) {
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: name, protocol, api_key: trimmedKey }),
+        body: JSON.stringify({ provider: name, protocol, capability, api_key: trimmedKey }),
       });
       if (res.ok) {
         const data = (await res.json().catch(() => null)) as { key?: ApiKey } | null;
         toast({
-          title: "تمت إضافة المفتاح وحفظ اسم الـ API",
+          title: "تمت إضافة المفتاح",
           description: data?.key?.masked_key
-            ? `الاسم «${name}» محفوظ — المفتاح: ${data.key.masked_key}`
-            : `الاسم «${name}» محفوظ — جاهز للاستخدام في التجربة التسلسلية`,
+            ? `«${name}» — ${capabilityLabel(capability)} — المفتاح: ${data.key.masked_key}`
+            : `«${name}» — ${capabilityLabel(capability)} — جاهز للتجربة التسلسلية`,
         });
         setApiKey("");
         await loadKeys();
@@ -207,8 +268,22 @@ export function KeyManager({ className }: { className?: string }) {
 
   const handleEdited = (updated: ApiKey) => {
     setKeys((prev) => (prev ? prev.map((k) => (k.id === updated.id ? updated : k)) : prev));
-    // إعادة تحميل القائمة ليُحدَّث سجل الأسماء المحفوظة (الاقتراحات) فورًا دون إعادة تحميل للصفحة
+    // إعادة تحميل القائمة ليُحدَّث سجل الأسماء المحفوظة (الاقتراحات) فورًا
     void loadKeys();
+  };
+
+  // تجميع المفاتيح حسب اسم الـ API الحر — نفس ترتيب التجربة التسلسلية في السيرفر
+  const groups = React.useMemo(() => groupKeysByName(keys ?? []), [keys]);
+
+  // ملخص الاستخدام لكل مجموعة — يجيب مباشرة على «هل المفتاح للصور أم للفيديو»
+  const groupSummary = (groupKeys: ApiKey[]): string => {
+    const counts: Record<KeyCapability, number> = { both: 0, image: 0, video: 0 };
+    for (const k of groupKeys) counts[k.capability] = (counts[k.capability] ?? 0) + 1;
+    const parts: string[] = [];
+    if (counts.both) parts.push(`صور وفيديو (${counts.both})`);
+    if (counts.image) parts.push(`صور فقط (${counts.image})`);
+    if (counts.video) parts.push(`فيديو فقط (${counts.video})`);
+    return parts.join(" · ") || "—";
   };
 
   return (
@@ -219,8 +294,9 @@ export function KeyManager({ className }: { className?: string }) {
           مدير المفاتيح
         </CardTitle>
         <CardDescription>
-          اكتب أي اسم تحبه للـ API — يُحفظ تلقائيًا ويظهر في الاقتراحات لاحقًا. أضف عدة مفاتيح — التجربة تسلسلية بترتيب
-          الإضافة (أول مفتاح ثم التالي…) مع تبديل فوري تلقائي عند أي خطأ أو نفاد رصيد دون توقف.
+          اكتب أي اسم تحبه للـ API (مثال: حسابي الأساسي، CometAPI ثاني) — يُحفظ تلقائيًا وتتجمّع مفاتيحه معًا. حدّد لكل
+          مفتاح استخدامه: صور أو فيديو أو الاثنين. التجربة تسلسلية: مفاتيح الاسم الأول بالترتيب ثم الاسم التالي، مع
+          تبديل فوري تلقائي عند أي خطأ أو نفاد رصيد دون توقف.
         </CardDescription>
       </CardHeader>
 
@@ -237,7 +313,7 @@ export function KeyManager({ className }: { className?: string }) {
                 value={apiName}
                 onChange={(e) => handleNameChange(e.target.value)}
                 placeholder="مثال: حسابي الأساسي، CometAPI ثاني…"
-                aria-label="اسم الـ API — نص حر يُحفظ تلقائيًا"
+                aria-label="اسم الـ API — نص حر يُحفظ تلقائيًا وتتجمّع مفاتيحه تحت هذا الاسم"
                 list={DATALIST_ID}
                 maxLength={60}
                 className="h-11"
@@ -249,10 +325,12 @@ export function KeyManager({ className }: { className?: string }) {
               </datalist>
             </div>
             <div className="flex flex-col gap-1.5">
-              <label className="text-xs font-medium text-muted-foreground">بروتوكول الاتصال</label>
-              <Select value={protocol} onValueChange={(v) => setProtocol(v as ProviderId)}>
-                <SelectTrigger aria-label="بروتوكول الاتصال" className="h-11 w-full data-[size=default]:h-11">
-                  <SelectValue placeholder="البروتوكول" />
+              <label htmlFor="protocol-select" className="text-xs font-medium text-muted-foreground">
+                طريقة الاتصال (حسب موقع المفتاح)
+              </label>
+              <Select value={protocol} onValueChange={handleProtocolChange}>
+                <SelectTrigger id="protocol-select" aria-label="طريقة الاتصال" className="h-11 w-full data-[size=default]:h-11">
+                  <SelectValue placeholder="الطريقة" />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="kie">kie.ai</SelectItem>
@@ -261,6 +339,17 @@ export function KeyManager({ className }: { className?: string }) {
               </Select>
             </div>
           </div>
+
+          {/* توضيح العلاقة بين الاسم وطريقة الاتصال — يتغير حسب الاسم المكتوب */}
+          <ProtocolHint apiName={apiName} protocol={protocol} names={names} />
+
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-muted-foreground">
+              استخدام المفتاح — للصور أم للفيديو؟
+            </span>
+            <CapabilityPicker value={capability} onChange={setCapability} idPrefix="add-cap" />
+          </div>
+
           <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center">
             <Input
               dir="ltr"
@@ -279,12 +368,11 @@ export function KeyManager({ className }: { className?: string }) {
           </div>
         </form>
 
-        {/* القائمة */}
+        {/* القائمة مجمّعة حسب اسم الـ API */}
         {keys === null && !loadFailed ? (
           <div className="flex flex-col gap-2" aria-hidden>
-            <Skeleton className="h-[76px] w-full rounded-lg" />
-            <Skeleton className="h-[76px] w-full rounded-lg" />
-            <Skeleton className="h-[76px] w-full rounded-lg" />
+            <Skeleton className="h-[110px] w-full rounded-lg" />
+            <Skeleton className="h-[110px] w-full rounded-lg" />
           </div>
         ) : loadFailed && keys === null ? (
           <div className="flex flex-col items-center gap-3 rounded-lg border border-rose-500/30 bg-rose-500/10 py-8 text-center">
@@ -299,28 +387,67 @@ export function KeyManager({ className }: { className?: string }) {
             <KeyRound className="size-8 text-muted-foreground/50" aria-hidden />
             <p className="text-sm font-medium">لا توجد مفاتيح بعد</p>
             <p className="max-w-sm text-xs text-muted-foreground">
-              اكتب اسم الـ API وأضف أول مفتاح من النموذج أعلاه — يمكنك إضافة عدة مفاتيح بنفس الاسم أو بأسماء مختلفة
-              وسيتبدل السيرفر بينها تلقائيًا بالترتيب.
+              اكتب اسم الـ API، اختر طريقة الاتصال حسب موقع المفتاح، حدّد الاستخدام (صور/فيديو) ثم ألصق المفتاح. أضف عدة
+              مفاتيح تحت نفس الاسم لتجربتها بالترتيب واحدًا تلو الآخر.
             </p>
           </div>
-        ) : keys !== null ? (
+        ) : keys !== null && groups.length > 0 ? (
           <div>
             <p className="mb-2 text-xs text-muted-foreground">
-              الترتيب التسلسلي للتجربة: المفتاح رقم 1 يُجرَّب أولًا ثم ما يليه تلقائيًا عند أي فشل.
+              الترتيب التسلسلي: داخل كل اسم يُجرَّب المفتاح 1 ثم 2 ثم 3… وعند نفادها كلها ينتقل تلقائيًا للاسم التالي —
+              التوليد يستخدم فقط المفاتيح المطابقة لنوعه (صور/فيديو).
             </p>
-            <div className="scrollbar-thin max-h-96 overflow-y-auto pe-1">
-              <ol className="flex flex-col gap-2">
-                {keys.map((key, index) => (
-                  <KeyRow
-                    key={key.id}
-                    apiKey={key}
-                    order={index + 1}
-                    busy={busyId === key.id}
-                    deleteBusy={deletingId === key.id}
-                    onToggle={() => void handleToggle(key)}
-                    onDelete={() => void handleDelete(key)}
-                    onEdit={() => setEditingKey(key)}
-                  />
+            <div className="scrollbar-thin max-h-[26rem] overflow-y-auto pe-1">
+              <ol className="flex flex-col gap-2.5">
+                {groups.map((group, gi) => (
+                  <li
+                    key={`${group.name}-${gi}`}
+                    className="rounded-lg border bg-muted/10 p-3 transition-colors hover:border-violet-500/40"
+                  >
+                    {/* رأس مجموعة اسم الـ API */}
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span
+                        aria-label={`ترتيب الاسم ${gi + 1} في التجربة التسلسلية`}
+                        title="ترتيب هذا الاسم في التجربة التسلسلية"
+                        className="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-violet-500/40 bg-violet-500/10 font-mono text-[11px] font-bold text-violet-300"
+                      >
+                        {gi + 1}
+                      </span>
+                      <span className="text-sm font-bold">{group.name}</span>
+                      <Badge
+                        variant="outline"
+                        dir="ltr"
+                        className="border-teal-500/30 bg-teal-500/10 font-mono text-[11px] text-teal-300"
+                      >
+                        {PROVIDER_LABELS[group.protocol] ?? group.protocol}
+                      </Badge>
+                      <span className="text-[11px] text-muted-foreground">
+                        {group.keys.length === 1 ? "مفتاح واحد" : `${group.keys.length} مفاتيح`}
+                      </span>
+                      {gi === 0 ? (
+                        <Badge variant="outline" className="border-violet-500/30 bg-violet-500/10 text-[11px] text-violet-300">
+                          يُجرَّب أولًا
+                        </Badge>
+                      ) : null}
+                      <span className="ms-auto text-[11px] text-muted-foreground">{groupSummary(group.keys)}</span>
+                    </div>
+
+                    {/* مفاتيح المجموعة — مرقّمة داخل الاسم */}
+                    <ol className="mt-2 flex flex-col gap-1.5">
+                      {group.keys.map((key, ki) => (
+                        <KeyRow
+                          key={key.id}
+                          apiKey={key}
+                          order={ki + 1}
+                          busy={busyId === key.id}
+                          deleteBusy={deletingId === key.id}
+                          onToggle={() => void handleToggle(key)}
+                          onDelete={() => void handleDelete(key)}
+                          onEdit={() => setEditingKey(key)}
+                        />
+                      ))}
+                    </ol>
+                  </li>
                 ))}
               </ol>
             </div>
@@ -328,13 +455,67 @@ export function KeyManager({ className }: { className?: string }) {
         ) : null}
       </CardContent>
 
-      {/* حوار تعديل الاسم/البروتوكول */}
-      <EditKeyDialog
-        apiKey={editingKey}
-        onClose={() => setEditingKey(null)}
-        onSaved={handleEdited}
-      />
+      {/* حوار تعديل الاسم/الطريقة/الاستخدام */}
+      <EditKeyDialog apiKey={editingKey} onClose={() => setEditingKey(null)} onSaved={handleEdited} />
     </Card>
+  );
+}
+
+/* --------------------- توضيح الاسم ↔ طريقة الاتصال --------------------- */
+
+function ProtocolHint({
+  apiName,
+  protocol,
+  names,
+}: {
+  apiName: string;
+  protocol: ProviderId;
+  names: ApiName[];
+}) {
+  const name = apiName.trim();
+  const protocolLabel = PROVIDER_LABELS[protocol] ?? protocol;
+
+  if (!name) {
+    return (
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        الاسم مجرد تسمية عندك تُحفظ كما كتبته — أما «طريقة الاتصال» فهي كيف يتكلم السيرفر فعليًا مع موقع المفتاح
+        (kie.ai أو CometAPI). اكتب اسمًا يحتوي «kie» أو «comet» وسنضبط الطريقة تلقائيًا.
+      </p>
+    );
+  }
+
+  const saved = names.find((n) => n.name.toLowerCase() === name.toLowerCase());
+  const detected = detectProtocolFromName(name);
+
+  if (saved && (saved.protocol === "kie" || saved.protocol === "cometapi")) {
+    return (
+      <p className="text-[11px] leading-relaxed text-emerald-300/90">
+        ✓ الاسم «{name}» محفوظ — طريقة الاتصال {PROVIDER_LABELS[saved.protocol] ?? saved.protocol} (المحفوظة سابقًا)
+        {protocol === saved.protocol ? "" : ` — أنت الآن تختار ${protocolLabel}`}.
+      </p>
+    );
+  }
+
+  if (detected) {
+    if (detected === protocol) {
+      return (
+        <p className="text-[11px] leading-relaxed text-emerald-300/90">
+          ✓ الاسم يشير إلى {PROVIDER_LABELS[detected]} — ضُبطت طريقة الاتصال تلقائيًا وفقًا له.
+        </p>
+      );
+    }
+    return (
+      <p className="text-[11px] leading-relaxed text-amber-300/90">
+        ملاحظة: الاسم يشير إلى {PROVIDER_LABELS[detected]} لكنك اخترت {protocolLabel} يدويًا — تأكد أن المفتاح أصلًا من
+        موقع {protocolLabel}.
+      </p>
+    );
+  }
+
+  return (
+    <p className="text-[11px] leading-relaxed text-muted-foreground">
+      المفاتيح تحت هذا الاسم ستتكلم ببروتوكول {protocolLabel} — غيّره من القائمة إذا كان المفتاح من موقع آخر.
+    </p>
   );
 }
 
@@ -357,25 +538,29 @@ function KeyRow({
   onDelete: () => void;
   onEdit: () => void;
 }) {
-  const protocolLabel = PROVIDER_LABELS[key.protocol] ?? key.protocol;
   const statusMeta = STATUS_META[key.status] ?? STATUS_META.disabled;
+  const capMeta =
+    key.capability === "image"
+      ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+      : key.capability === "video"
+        ? "border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-300"
+        : "border-violet-500/30 bg-violet-500/10 text-violet-300";
 
   return (
-    <li className="rounded-lg border bg-muted/20 p-3 transition-colors hover:border-violet-500/40">
+    <li className="rounded-md border bg-background/40 p-2.5 transition-colors hover:border-violet-500/40">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
         <span
-          aria-label={`الترتيب التسلسلي ${order}`}
-          title="ترتيب التجربة التسلسلية"
-          className="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-violet-500/40 bg-violet-500/10 font-mono text-[11px] font-bold text-violet-300"
+          aria-label={`ترتيب المفتاح ${order} داخل هذا الاسم`}
+          title="ترتيب التجربة التسلسلية داخل هذا الاسم"
+          className="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-muted/40 font-mono text-[11px] font-bold text-foreground/80"
         >
           {order}
         </span>
-        <span className="text-sm font-semibold">{key.provider?.trim() || "بدون اسم"}</span>
         <code dir="ltr" className="font-mono text-[11px] text-muted-foreground">
           {key.masked_key}
         </code>
-        <Badge variant="outline" dir="ltr" className="border-teal-500/30 bg-teal-500/10 font-mono text-[11px] text-teal-300">
-          {protocolLabel}
+        <Badge variant="outline" className={cn("text-[11px]", capMeta)}>
+          {capabilityLabel(key.capability)}
         </Badge>
         <Badge variant="outline" className={cn(statusMeta.badgeClass)}>
           {statusMeta.label}
@@ -388,7 +573,7 @@ function KeyRow({
             className="h-11 px-3"
             disabled={busy || deleteBusy}
             onClick={onEdit}
-            aria-label={`تعديل اسم الـ API أو البروتوكول للمفتاح ${key.masked_key}`}
+            aria-label={`تعديل المفتاح ${key.masked_key}`}
           >
             <Pencil className="size-4" aria-hidden />
             تعديل
@@ -445,7 +630,7 @@ function KeyRow({
         </span>
       </div>
 
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
         <span>
           استخدام: {key.usage_count ?? 0} | نجاح: {key.success_count ?? 0} | فشل: {key.fail_count ?? 0}
         </span>
@@ -454,7 +639,7 @@ function KeyRow({
       </div>
 
       {key.last_error ? (
-        <p dir="auto" className="mt-1.5 line-clamp-2 text-xs text-muted-foreground/80">
+        <p dir="auto" className="mt-1 line-clamp-2 text-xs text-muted-foreground/80">
           آخر خطأ: {key.last_error}
         </p>
       ) : null}
@@ -476,6 +661,7 @@ function EditKeyDialog({
   const { toast } = useToast();
   const [name, setName] = React.useState("");
   const [protocol, setProtocol] = React.useState<ProviderId>("kie");
+  const [capability, setCapability] = React.useState<KeyCapability>("both");
   const [saving, setSaving] = React.useState(false);
   const initializedFor = React.useRef<string | null>(null);
 
@@ -483,6 +669,7 @@ function EditKeyDialog({
     if (key && initializedFor.current !== key.id) {
       setName(key.provider ?? "");
       setProtocol(key.protocol === "cometapi" ? "cometapi" : "kie");
+      setCapability(key.capability === "image" ? "image" : key.capability === "video" ? "video" : "both");
       initializedFor.current = key.id;
     }
     if (!key) initializedFor.current = null;
@@ -500,7 +687,7 @@ function EditKeyDialog({
       const res = await fetch(`/api/keys/${encodeURIComponent(key.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: trimmed, protocol }),
+        body: JSON.stringify({ provider: trimmed, protocol, capability }),
       });
       if (!res.ok) {
         const data = (await res.json().catch(() => null)) as ApiErrorBody | null;
@@ -511,7 +698,7 @@ function EditKeyDialog({
       if (data?.key) onSaved(data.key);
       toast({
         title: "تم حفظ التعديلات",
-        description: `الاسم «${trimmed}» محفوظ الآن في الاقتراحات أيضًا`,
+        description: `الاسم «${trimmed}» — ${capabilityLabel(capability)} — محفوظ في الاقتراحات أيضًا`,
       });
       onClose();
     } catch {
@@ -525,10 +712,10 @@ function EditKeyDialog({
     <Dialog open={key !== null} onOpenChange={(open) => (open ? undefined : onClose())}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>تعديل اسم الـ API والبروتوكول</DialogTitle>
+          <DialogTitle>تعديل المفتاح</DialogTitle>
           <DialogDescription>
-            المفتاح: <code dir="ltr" className="font-mono">{key?.masked_key}</code> — غيّر الاسم أو البروتوكول وسيُحفظ
-            الاسم الجديد تلقائيًا.
+            المفتاح: <code dir="ltr" className="font-mono">{key?.masked_key}</code> — غيّر الاسم أو طريقة الاتصال أو
+            الاستخدام وسيُحفظ تلقائيًا.
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-3 py-1">
@@ -545,16 +732,20 @@ function EditKeyDialog({
             />
           </div>
           <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-medium text-muted-foreground">بروتوكول الاتصال</label>
+            <label className="text-xs font-medium text-muted-foreground">طريقة الاتصال (حسب موقع المفتاح)</label>
             <Select value={protocol} onValueChange={(v) => setProtocol(v as ProviderId)}>
-              <SelectTrigger aria-label="بروتوكول الاتصال" className="h-11 w-full data-[size=default]:h-11">
-                <SelectValue placeholder="البروتوكول" />
+              <SelectTrigger aria-label="طريقة الاتصال" className="h-11 w-full data-[size=default]:h-11">
+                <SelectValue placeholder="الطريقة" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="kie">kie.ai</SelectItem>
                 <SelectItem value="cometapi">CometAPI</SelectItem>
               </SelectContent>
             </Select>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-muted-foreground">استخدام المفتاح — للصور أم للفيديو؟</span>
+            <CapabilityPicker value={capability} onChange={setCapability} idPrefix="edit-cap" />
           </div>
         </div>
         <DialogFooter className="gap-2">

@@ -8,14 +8,14 @@ export const dynamic = "force-dynamic";
 export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   await ensureSchema();
   const { id } = await ctx.params;
-  let body: { status?: string; label?: string; provider?: string; protocol?: string };
+  let body: { status?: string; label?: string; provider?: string; protocol?: string; capability?: string };
   try {
     body = (await req.json()) as typeof body;
   } catch {
     return Response.json({ error: "جسم الطلب ليس JSON صالحًا" }, { status: 400 });
   }
 
-  const patch: { status?: string; provider?: string; protocol?: string } = {};
+  const patch: { status?: string; provider?: string; protocol?: string; capability?: string } = {};
   if (body.status !== undefined) {
     if (body.status !== "active" && body.status !== "disabled") {
       return Response.json({ error: "الحالة يجب أن تكون active أو disabled" }, { status: 400 });
@@ -34,6 +34,16 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
       return Response.json({ error: "بروتوكول الاتصال يجب أن يكون kie أو cometapi" }, { status: 400 });
     }
     patch.protocol = protocol;
+  }
+  if (body.capability !== undefined) {
+    const capability = String(body.capability).trim();
+    if (capability !== "both" && capability !== "image" && capability !== "video") {
+      return Response.json(
+        { error: "استخدام المفتاح يجب أن يكون: both أو image أو video" },
+        { status: 400 },
+      );
+    }
+    patch.capability = capability;
   }
 
   const key = await patchKey(id, patch);
