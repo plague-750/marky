@@ -29,7 +29,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ar" dir="rtl" className="dark" suppressHydrationWarning>
-      <body className="antialiased bg-background text-foreground">
+      {/* suppressHydrationWarning هنا مقصودة: بعض إضافات المتصفح تحقن خصائص على <body>
+          (مثل bis_status و__processed_...) قبل تحميل React — فهذا يتجاهل تعارض الخصائص
+          على هذا الوسم فقط دون إخفاء أي أخطاء حقيقية داخل الصفحة */}
+      <body className="antialiased bg-background text-foreground" suppressHydrationWarning>
         {/* React يرفع روابط الخطوط تلقائيًا إلى <head> */}
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
