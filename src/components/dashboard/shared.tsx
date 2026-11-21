@@ -135,6 +135,71 @@ export const PROVIDER_LABELS: Record<string, string> = {
   cometapi: "CometAPI",
 };
 
+/** خيارات «طريقة الاتصال» الاحتياطية عند تعذر تحميل قائمة المزودين من السيرفر */
+export const DEFAULT_PROVIDER_ROWS: ProviderRow[] = [
+  { id: "kie", name: "kie.ai", base_url: "https://api.kie.ai", auth_type: "bearer", auth_header: "Authorization", adapter_type: "kie", image_endpoint: "", video_endpoint: "", check_endpoint: "", enabled: 1, created_at: "" },
+  { id: "cometapi", name: "CometAPI", base_url: "https://api.cometapi.com", auth_type: "bearer", auth_header: "Authorization", adapter_type: "cometapi", image_endpoint: "", video_endpoint: "", check_endpoint: "", enabled: 1, created_at: "" },
+];
+
+/** نتيجة مطابقة النص الحر ل«طريقة الاتصال» بمزود من قاعدة البيانات */
+export interface SiteResolution {
+  /** معرّف المزود النهائي الذي سيُحفظ كبروتوكول للمفتاح */
+  protocol: string;
+  /** اسم المزود للعرض */
+  providerLabel: string;
+  /** true = تطابق حقيقي (اسم/رابط/كلمة مفتاحية) — false = fallback لأول مزود مفعّل */
+  matched: boolean;
+}
+
+/** يزيل https:// أو http:// وشرطة النهاية لتوحيد مطابقة الروابط */
+function normalizeUrlish(s: string): string {
+  return s.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+}
+
+/**
+ * مطابقة نص حر (اسم/رابط/نوع موقع الـ API كما كتبه المستخدم) بمزود — نفس منطق السيرفر، بلا Hardcoding:
+ * تطابق تام (المعرّف/الاسم/الرابط) ← احتواء جزئي ← كلمات مفتاحية (comet/kie) ← أول مزود مفعّل (fallback).
+ * تعيد null فقط إذا لم يوجد أي مزود إطلاقًا.
+ */
+export function resolveProtocolFromSite(value: string, providers: ProviderRow[] | null): SiteResolution | null {
+  const list = providers && providers.length ? providers : DEFAULT_PROVIDER_ROWS;
+  if (!list.length) return null;
+  const fallbackRow = list.find((p) => p.enabled) ?? list[0];
+  const fallback: SiteResolution = { protocol: fallbackRow.id, providerLabel: fallbackRow.name, matched: false };
+
+  const v = (value || "").trim().toLowerCase();
+  if (!v) return fallback;
+  const vUrl = normalizeUrlish(v);
+
+  // 1) تطابق تام مع المعرّف أو الاسم أو الرابط
+  for (const p of list) {
+    if (p.id.toLowerCase() === v || p.name.trim().toLowerCase() === v || normalizeUrlish(p.base_url) === vUrl) {
+      return { protocol: p.id, providerLabel: p.name, matched: true };
+    }
+  }
+  // 2) احتواء جزئي: النص يحوي اسم/معرّف/مضيف المزود أو العكس
+  for (const p of list) {
+    const id = p.id.toLowerCase();
+    const name = p.name.trim().toLowerCase();
+    const host = normalizeUrlish(p.base_url);
+    const hostHit = !!host && (vUrl.includes(host) || (vUrl.length >= 5 && host.includes(vUrl)));
+    const nameHit = name.length >= 3 && v.length >= 3 && (v.includes(name) || name.includes(v));
+    const idHit = id.length >= 3 && v.length >= 3 && (v.includes(id) || id.includes(v));
+    if (hostHit || nameHit || idHit) return { protocol: p.id, providerLabel: p.name, matched: true };
+  }
+  // 3) كلمات مفتاحية شائعة في النص
+  if (vUrl.includes("comet") || v.includes("comet")) {
+    const p = list.find((x) => x.id.toLowerCase().includes("comet") || x.name.toLowerCase().includes("comet"));
+    if (p) return { protocol: p.id, providerLabel: p.name, matched: true };
+  }
+  if (vUrl.includes("kie") || v.includes("kie")) {
+    const p = list.find((x) => x.id.toLowerCase().includes("kie") || x.name.toLowerCase().includes("kie"));
+    if (p) return { protocol: p.id, providerLabel: p.name, matched: true };
+  }
+  // 4) fallback — أول مزود مفعّل
+  return fallback;
+}
+
 export const CAPABILITY_LABELS: Record<KeyCapability, string> = {
   both: "صور وفيديو",
   image: "صور فقط",
@@ -145,14 +210,6 @@ export function capabilityLabel(c: string | null | undefined): string {
   if (c === "image") return CAPABILITY_LABELS.image;
   if (c === "video") return CAPABILITY_LABELS.video;
   return CAPABILITY_LABELS.both;
-}
-
-/** استنتاج البروتوكول من الاسم الحر — comet → CometAPI وkie → kie.ai وإلا null */
-export function detectProtocolFromName(name: string): ProviderId | null {
-  const n = (name || "").toLowerCase();
-  if (n.includes("comet")) return "cometapi";
-  if (n.includes("kie")) return "kie";
-  return null;
 }
 
 /* --------------------- تجميع المفاتيح حسب اسم الـ API --------------------- */

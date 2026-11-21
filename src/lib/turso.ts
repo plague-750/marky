@@ -659,6 +659,53 @@ export async function getProviderById(id: string): Promise<ProviderRow | null> {
   return rowToProvider(rs.rows[0] as Record<string, unknown>);
 }
 
+/** يزيل https:// أو http:// وشرطة النهاية لتوحيد مطابقة الروابط */
+function normalizeUrlish(s: string): string {
+  return s.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+}
+
+/**
+ * مطابقة نص حر (اسم/رابط/نوع موقع الـ API كما كتبه المستخدم) بمزود من قاعدة البيانات — بلا Hardcoding.
+ * ترتيب المطابقة: تطابق تام (المعرّف ثم الاسم ثم الرابط) ← ثم احتواء جزئي بالاتجاهين ← ثم كلمات مفتاحية معروفة.
+ * إن لم يطابق شيئًا يُعاد أول مزود مفعّل (fallback) حتى يظل المفتاح صالحًا للتجربة التسلسلية.
+ */
+export function resolveProviderIdFromText(text: string, providers: ProviderRow[]): string | null {
+  const value = (text || "").trim().toLowerCase();
+  if (!value) {
+    return providers.find((p) => p.enabled)?.id ?? providers[0]?.id ?? null;
+  }
+  const valueUrlish = normalizeUrlish(value);
+
+  // 1) تطابق تام مع المعرّف أو الاسم أو الرابط
+  for (const p of providers) {
+    if (p.id.toLowerCase() === value || p.name.trim().toLowerCase() === value || normalizeUrlish(p.base_url) === valueUrlish) {
+      return p.id;
+    }
+  }
+  // 2) احتواء جزئي: النص يحوي اسم/معرّف/مضيف المزود أو العكس
+  for (const p of providers) {
+    const id = p.id.toLowerCase();
+    const name = p.name.trim().toLowerCase();
+    const host = normalizeUrlish(p.base_url);
+    if (!host && !name && !id) continue;
+    const hostHit = !!host && (valueUrlish.includes(host) || (valueUrlish.length >= 5 && host.includes(valueUrlish)));
+    const nameHit = name.length >= 3 && value.length >= 3 && (value.includes(name) || name.includes(value));
+    const idHit = id.length >= 3 && value.length >= 3 && (value.includes(id) || id.includes(value));
+    if (hostHit || nameHit || idHit) return p.id;
+  }
+  // 3) كلمات مفتاحية شائعة في النص (comet / kie)
+  if (valueUrlish.includes("comet") || value.includes("comet")) {
+    const comet = providers.find((p) => p.id.toLowerCase().includes("comet") || p.name.toLowerCase().includes("comet"));
+    if (comet) return comet.id;
+  }
+  if (valueUrlish.includes("kie") || value.includes("kie")) {
+    const kie = providers.find((p) => p.id.toLowerCase().includes("kie") || p.name.toLowerCase().includes("kie"));
+    if (kie) return kie.id;
+  }
+  // 4) fallback — أول مزود مفعّل
+  return providers.find((p) => p.enabled)?.id ?? providers[0]?.id ?? null;
+}
+
 export interface ProviderPatch {
   name?: string;
   base_url?: string;
