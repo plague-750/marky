@@ -5,9 +5,9 @@ import {
   patchKey,
   deleteKey,
   rememberApiName,
-  getProviderById,
   listProviders,
-  resolveProviderIdFromText,
+  matchProviderIdFromText,
+  autoProvisionProviderFromText,
   toSafeKey,
 } from "@/lib/turso";
 
@@ -17,12 +17,14 @@ export const dynamic = "force-dynamic";
 export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   await ensureSchema();
   const { id } = await ctx.params;
-  let body: { status?: string; label?: string; provider?: string; protocol?: string; capability?: string };
+  let body: { status?: string; label?: string; provider?: string; protocol?: string; capability?: string; auto_provision?: boolean };
   try {
     body = (await req.json()) as typeof body;
   } catch {
     return Response.json({ error: "جسم الطلب ليس JSON صالحًا" }, { status: 400 });
   }
+
+  let autoProvisioned = false;
 
   const patch: { status?: string; provider?: string; protocol?: string; capability?: string } = {};
   if (body.status !== undefined) {
@@ -37,17 +39,26 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     if (name.length > 60) return Response.json({ error: "نص طريقة الاتصال طويل جدًا (الحد 60 حرفًا)" }, { status: 400 });
     patch.provider = name;
   }
-  if (body.protocol !== undefined) {
-    const protocol = String(body.protocol).trim();
+  const autoProvisionWanted = Boolean(body.auto_provision);
+  if (body.protocol !== undefined || (autoProvisionWanted && body.provider !== undefined)) {
+    const protocol = String(body.protocol ?? "").trim();
     // المزود يجب أن يكون موجودًا في جدول providers — بلا Hardcoding.
-    // إن لم يكن المرسل معرّفًا مباشرًا نطابق النص الحر بمزود (اسم/رابط) قبل الرفض.
-    let providerId = protocol;
-    if (!(await getProviderById(providerId))) {
-      const providers = await listProviders();
-      providerId =
-        resolveProviderIdFromText(protocol, providers) ??
-        (body.provider !== undefined ? resolveProviderIdFromText(String(body.provider), providers) : null) ??
-        "";
+    // معرّف صريح ← مطابقة النص الحر ← إنشاء مزود تلقائي (auto_provision) ← رفض بوضوح.
+    const providers = await listProviders();
+    let providerId: string | null = null;
+    if (protocol && providers.some((p) => p.id === protocol)) {
+      providerId = protocol;
+    } else {
+      providerId = matchProviderIdFromText(protocol || String(body.provider ?? ""), providers);
+      if (!providerId && autoProvisionWanted) {
+        try {
+          const ap = await autoProvisionProviderFromText(String(body.provider ?? protocol));
+          providerId = ap.id;
+          autoProvisioned = ap.created;
+        } catch {
+          providerId = null;
+        }
+      }
     }
     if (!providerId) {
       return Response.json(
@@ -71,7 +82,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
   const key = await patchKey(id, patch);
   if (!key) return Response.json({ error: "لا يوجد مفتاح بهذا المعرّف" }, { status: 404 });
   if (patch.provider !== undefined) await rememberApiName(key.provider, key.protocol);
-  return Response.json({ key: toSafeKey(key) });
+  return Response.json({ key: toSafeKey(key), auto_provisioned: autoProvisioned });
 }
 
 export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {

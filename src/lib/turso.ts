@@ -665,15 +665,13 @@ function normalizeUrlish(s: string): string {
 }
 
 /**
- * مطابقة نص حر (اسم/رابط/نوع موقع الـ API كما كتبه المستخدم) بمزود من قاعدة البيانات — بلا Hardcoding.
+ * مطابقة صارمة للنص الحر (اسم/رابط/نوع موقع الـ API) بمزود من قاعدة البيانات — بلا Hardcoding.
  * ترتيب المطابقة: تطابق تام (المعرّف ثم الاسم ثم الرابط) ← ثم احتواء جزئي بالاتجاهين ← ثم كلمات مفتاحية معروفة.
- * إن لم يطابق شيئًا يُعاد أول مزود مفعّل (fallback) حتى يظل المفتاح صالحًا للتجربة التسلسلية.
+ * تعيد null عند عدم وجود تطابق حقيقي (بدون أي fallback) — تستخدمها آلية الإنشاء التلقائي للمزودين.
  */
-export function resolveProviderIdFromText(text: string, providers: ProviderRow[]): string | null {
+export function matchProviderIdFromText(text: string, providers: ProviderRow[]): string | null {
   const value = (text || "").trim().toLowerCase();
-  if (!value) {
-    return providers.find((p) => p.enabled)?.id ?? providers[0]?.id ?? null;
-  }
+  if (!value) return null;
   const valueUrlish = normalizeUrlish(value);
 
   // 1) تطابق تام مع المعرّف أو الاسم أو الرابط
@@ -702,8 +700,93 @@ export function resolveProviderIdFromText(text: string, providers: ProviderRow[]
     const kie = providers.find((p) => p.id.toLowerCase().includes("kie") || p.name.toLowerCase().includes("kie"));
     if (kie) return kie.id;
   }
-  // 4) fallback — أول مزود مفعّل
+  return null;
+}
+
+/**
+ * مطابقة النص الحر بمزود مع fallback لأول مزود مفعّل — للتوافق مع العملاء القدامى
+ * (استخدم matchProviderIdFromText إن أردت صرامة المطابقة دون fallback).
+ */
+export function resolveProviderIdFromText(text: string, providers: ProviderRow[]): string | null {
+  const matched = matchProviderIdFromText(text, providers);
+  if (matched) return matched;
   return providers.find((p) => p.enabled)?.id ?? providers[0]?.id ?? null;
+}
+
+/** أنواع المحولات المدعومة — يُستخدم في تخمين نوع المحول للإنشاء التلقائي */
+const KNOWN_ADAPTERS = [...ADAPTER_TYPES];
+
+/** يولّد معرّف مزود صالحًا (حروف إنجليزية/أرقام/شرطات) من نص حر — نص عربي بالكامل → معرّف عشوائي */
+function providerSlugFromText(text: string): string {
+  const cleaned = text
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split("/")[0]
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (cleaned && PROVIDER_ID_RE.test(cleaned)) return cleaned.slice(0, 40);
+  return `site-${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`;
+}
+
+/**
+ * إنشاء مزود تلقائيًا من نص حر كتبه المستخدم (اسم أو رابط أي موقع API) — بلا أي Hardcoding:
+ * - المعرّف يُشتق من النص، والاسم هو النص كما كُتب.
+ * - إن كان النص رابطًا → يصبح base_url مباشرة؛ دومينًا → يُسبق بـ https؛ وإلا تخمين يُعدَّل من الواجهة.
+ * - نوع المحول يُخمَّن من الكلمات المفتاحية (افتراضيًا cometapi — الشكل المتوافق مع OpenAI الأشهر).
+ * - يُربط تلقائيًا بكل الموديلات الموجودة في خرائط الموديلات بأولوية أخيرة (يُجرَّب بعد المزودين الحاليين).
+ * إن كان المعرّف موجودًا مسبقًا يُعاد كما هو دون إنشاء (created: false).
+ */
+export async function autoProvisionProviderFromText(text: string): Promise<{ id: string; created: boolean }> {
+  const raw = (text || "").trim();
+  if (!raw) throw new Error("نص الموقع فارغ — لا يمكن إنشاء مزود");
+  const id = providerSlugFromText(raw);
+
+  const existing = await getProviderById(id);
+  if (existing) return { id: existing.id, created: false };
+
+  // base_url: رابط كامل → الأصل (origin) | دومين → https | غير ذلك → تخمين قابل للتعديل
+  let baseUrl: string;
+  if (/^https?:\/\//i.test(raw)) {
+    baseUrl = raw.split("/").slice(0, 3).join("/");
+  } else if (/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(raw)) {
+    baseUrl = `https://${raw}`;
+  } else {
+    baseUrl = `https://${id}.com`;
+  }
+  const adapterType = KNOWN_ADAPTERS.find((a) => id.includes(a) || raw.toLowerCase().includes(a)) ?? "cometapi";
+
+  await insertProvider({
+    id,
+    name: raw.slice(0, 80),
+    base_url: baseUrl,
+    auth_type: "bearer",
+    auth_header: "Authorization",
+    adapter_type: adapterType,
+    enabled: 1,
+  });
+
+  // ربط تلقائي بكل موديل موجود — أولوية أخيرة بعد كل المزودين الحاليين
+  const mappings = await listModelMappings();
+  const maxPriority = mappings.reduce((mx, m) => Math.max(mx, m.priority), 0);
+  const seen = new Set<string>();
+  for (const m of mappings) {
+    const key = `${m.canonical}::${m.type}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    await insertModelMapping({
+      canonical: m.canonical,
+      type: m.type,
+      provider_id: id,
+      provider_model_name: m.canonical,
+      priority: maxPriority + 1,
+      enabled: 1,
+    });
+  }
+
+  return { id, created: true };
 }
 
 export interface ProviderPatch {

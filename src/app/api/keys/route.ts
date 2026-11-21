@@ -10,7 +10,9 @@ import {
   rememberApiName,
   listApiNames,
   listProviders,
+  matchProviderIdFromText,
   resolveProviderIdFromText,
+  autoProvisionProviderFromText,
   toSafeKey,
 } from "@/lib/turso";
 
@@ -30,7 +32,7 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   await ensureSchema();
-  let body: { provider?: string; protocol?: string; api_key?: string; label?: string; capability?: string };
+  let body: { provider?: string; protocol?: string; api_key?: string; label?: string; capability?: string; auto_provision?: boolean };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -54,23 +56,39 @@ export async function POST(req: NextRequest) {
   }
 
   // مطابقة النص الحر بمزود من جدول providers — بلا Hardcoding:
-  // معرّف صريح ← نص صريح ← نص الموقع كما كُتب ← أول مزود مفعّل
+  // معرّف صريح ← نص صريح ← إنشاء مزود تلقائي من النص (auto_provision) ← أول مزود مفعّل (توافق قديم)
+  const autoProvision = Boolean(body.auto_provision);
   const providers = await listProviders();
-  if (!providers.length) {
-    return Response.json({ error: "لا يوجد مزودون — أضف مزودًا أولًا من «إدارة المزودين»" }, { status: 400 });
-  }
   let protocol: string;
+  let autoProvisioned = false;
   if (protocolHint && providers.some((p) => p.id === protocolHint)) {
     protocol = protocolHint;
   } else {
-    const resolved = resolveProviderIdFromText(protocolHint || provider, providers);
-    if (!resolved) {
-      return Response.json(
-        { error: `لم نتمكن من مطابقة «${provider}» بأي مزود — أضف مزودًا من «إدارة المزودين»` },
-        { status: 400 },
-      );
+    const matched = matchProviderIdFromText(protocolHint || provider, providers);
+    if (matched) {
+      protocol = matched;
+    } else if (autoProvision) {
+      // أي موقع جديد يكتبه المستخدم يُنشأ له مزود فورًا مع ربطه بكل الموديلات — بلا أي خطوة يدوية
+      try {
+        const ap = await autoProvisionProviderFromText(provider);
+        protocol = ap.id;
+        autoProvisioned = ap.created;
+      } catch (e) {
+        return Response.json(
+          { error: e instanceof Error ? e.message : `لم نتمكن من مطابقة «${provider}» بأي مزود — أضف مزودًا من «إدارة المزودين»` },
+          { status: 400 },
+        );
+      }
+    } else {
+      const resolved = resolveProviderIdFromText(protocolHint || provider, providers);
+      if (!resolved) {
+        return Response.json(
+          { error: `لم نتمكن من مطابقة «${provider}» بأي مزود — أضف مزودًا من «إدارة المزودين»` },
+          { status: 400 },
+        );
+      }
+      protocol = resolved;
     }
-    protocol = resolved;
   }
   if (!CAPABILITIES.has(capability)) {
     return Response.json({ error: "استخدام المفتاح يجب أن يكون: both (صور وفيديو) أو image (صور فقط) أو video (فيديو فقط)" }, { status: 400 });
@@ -88,5 +106,5 @@ export async function POST(req: NextRequest) {
   const key = await insertKey(provider, apiKey, label, protocol, capability);
   // حفظ نص الموقع كما كُتب — يظهر في الاقتراحات لاحقًا حتى لو حُذفت كل مفاتيحه
   await rememberApiName(provider, protocol);
-  return Response.json({ key: toSafeKey(key), resolved_protocol: protocol }, { status: 201 });
+  return Response.json({ key: toSafeKey(key), resolved_protocol: protocol, auto_provisioned: autoProvisioned }, { status: 201 });
 }

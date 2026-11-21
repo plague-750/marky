@@ -215,19 +215,28 @@ export function KeyManager({ className }: { className?: string }) {
       });
       return;
     }
+    // موقع معروف → بروتوكوله مباشرة؛ موقع جديد → يُنشأ مزودًا تلقائيًا في السيرفر (بلا أي خطوة يدوية)
     const providerLabel = PROVIDER_LABELS[resolved.protocol] ?? resolved.providerLabel;
     setAdding(true);
     try {
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: siteText, protocol: resolved.protocol, capability, api_key: trimmedKey }),
+        body: JSON.stringify({
+          provider: siteText,
+          protocol: resolved.matched ? resolved.protocol : "",
+          auto_provision: true,
+          capability,
+          api_key: trimmedKey,
+        }),
       });
       if (res.ok) {
-        const data = (await res.json().catch(() => null)) as { key?: ApiKey } | null;
-        const matchNote = resolved.matched
-          ? `الاتصال عبر «${providerLabel}»`
-          : `لم نتعرف على الموقع فاستخدمنا «${providerLabel}»`;
+        const data = (await res.json().catch(() => null)) as { key?: ApiKey; auto_provisioned?: boolean } | null;
+        const matchNote = data?.auto_provisioned
+          ? `أُنشئ مزود جديد «${siteText}» تلقائيًا — سيُجرَّب بعد المزودين الحاليين، وعدّل رابطه من «إدارة المزودين»`
+          : resolved.matched
+            ? `الاتصال عبر «${providerLabel}»`
+            : `اتصال عبر «${providerLabel}»`;
         toast({
           title: "تمت إضافة المفتاح",
           description: `«${siteText}» — ${capabilityLabel(capability)} — ${matchNote}${
@@ -326,9 +335,10 @@ export function KeyManager({ className }: { className?: string }) {
           مدير المفاتيح
         </CardTitle>
         <CardDescription>
-          اكتب في «طريقة الاتصال» اسم أو رابط موقع الـ API بحرية — النص يُحفظ تلقائيًا مع المفتاح ويظهر في الاقتراحات
-          عند إعادة التحميل. حدّد لكل مفتاح استخدامه: صور أو فيديو أو الاثنين. التجربة تسلسلية: مفاتيح الموقع الأول
-          بالترتيب ثم الموقع التالي، مع تبديل فوري تلقائي عند أي خطأ أو نفاد رصيد دون توقف.
+          اكتب في «طريقة الاتصال» اسم أو رابط موقع الـ API بحرية — النص يُحفظ تلقائيًا مع المفتاح، وأي موقع جديد يُنشأ له
+          مزود تلقائيًا ويُدرج في دورة التوليد بلا أي خطوة يدوية. حدّد لكل مفتاح استخدامه: صور أو فيديو أو الاثنين.
+          التجربة تسلسلية: مفاتيح الموقع الأول بالترتيب ثم الموقع التالي، مع تبديل فوري تلقائي عند أي خطأ أو نفاد رصيد
+          دون توقف.
         </CardDescription>
       </CardHeader>
 
@@ -515,15 +525,15 @@ function SiteHint({
   if (keepLabel) {
     return (
       <p className="text-[11px] leading-relaxed text-amber-300/90">
-        لم نتعرف على «{text}» من قائمة المزودين — عند الحفظ سيبقى الاتصال عبر المزود الحالي «{keepLabel}» كما هو، والنص
-        سيُحفظ كما كتبته. أضف مزودك من «إدارة المزودين» إن أردت بروتوكولًا آخر.
+        «{text}» ليس من المزودين الحاليين — عند الحفظ سيُنشأ مزودًا جديدًا تلقائيًا ويرتبط المفتاح به بدل «{keepLabel}».
+        أعد النص إلى قيمته السابقة إن أردت البقاء على المزود الحالي.
       </p>
     );
   }
   return (
     <p className="text-[11px] leading-relaxed text-amber-300/90">
-      لم نتعرف على «{text}» من قائمة المزودين — سيُستخدم المزود «{label}» للاتصال مؤقتًا، والنص سيُحفظ كما كتبته. أضف
-      مزودك من «إدارة المزودين» إن أردت بروتوكولًا آخر.
+      لم نتعرف على «{text}» كأحد المزودين الحاليين — سيُنشأ مزود جديد تلقائيًا عند إضافة المفتاح ويُجرَّب بعد المزودين
+      الحاليين. عدّل رابطه ونوع محوله من «إدارة المزودين» متى شئت.
     </p>
   );
 }
@@ -702,22 +712,32 @@ function EditKeyDialog({
     }
     setSaving(true);
     try {
-      const nextProtocol = resolution?.matched ? resolution.protocol : key.protocol;
+      // نص لم يتغير → لا نلمس البروتوكول إطلاقًا؛ تغيّر وطابق مزودًا → بروتوكوله؛
+      // تغيّر ولم يطابق → يُنشأ مزودًا جديدًا تلقائيًا في السيرفر (بلا أي خطوة يدوية)
+      const textChanged = trimmed !== (key.provider ?? "");
+      const matchedProtocol = resolution?.matched ? resolution.protocol : null;
+      const payload: Record<string, unknown> = { provider: trimmed, capability };
+      if (textChanged || matchedProtocol) {
+        payload.protocol = matchedProtocol ?? "";
+        payload.auto_provision = true;
+      }
       const res = await fetch(`/api/keys/${encodeURIComponent(key.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: trimmed, protocol: nextProtocol, capability }),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) {
         const data = (await res.json().catch(() => null)) as ApiErrorBody | null;
         toast({ title: "تعذّر حفظ التعديلات", description: data?.error ?? "حاول مجددًا", variant: "destructive" });
         return;
       }
-      const data = (await res.json().catch(() => null)) as { key?: ApiKey } | null;
+      const data = (await res.json().catch(() => null)) as { key?: ApiKey; auto_provisioned?: boolean } | null;
       if (data?.key) onSaved(data.key);
-      const nextLabel = resolution?.matched
-        ? `الاتصال عبر «${PROVIDER_LABELS[nextProtocol] ?? resolution.providerLabel}»`
-        : "بروتوكول الاتصال السابق بقي كما هو";
+      const nextLabel = data?.auto_provisioned
+        ? `أُنشئ مزود جديد «${trimmed}» تلقائيًا — سيُجرَّب بعد المزودين الحاليين، وعدّل رابطه من «إدارة المزودين»`
+        : matchedProtocol
+          ? `الاتصال عبر «${PROVIDER_LABELS[matchedProtocol] ?? resolution!.providerLabel}»`
+          : "بروتوكول الاتصال السابق بقي كما هو";
       toast({
         title: "تم حفظ التعديلات",
         description: `«${trimmed}» — ${capabilityLabel(capability)} — ${nextLabel} — محفوظ في الاقتراحات أيضًا`,
