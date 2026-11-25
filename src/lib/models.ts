@@ -16,23 +16,25 @@ export interface ModelDef {
 // أسماء الموديلات الافتراضية (احتياط فقط — الحقيقة في قاعدة البيانات) قابلة للتجاوز بمتغيرات البيئة
 const KIE_IMAGE_MODEL = process.env.KIE_IMAGE_MODEL || "gpt-image-2-6/flare-text-to-image";
 const COMETAPI_IMAGE_MODEL = process.env.COMETAPI_IMAGE_MODEL || "gpt-image-2.6-flare-text-to-image";
+const NPEXAPI_IMAGE_MODEL = process.env.NPEXAPI_IMAGE_MODEL || "gpt-image-2-6/flare-text-to-image";
 const KIE_VIDEO_MODEL = process.env.KIE_VIDEO_MODEL || "grok-imagine-video-1-5-preview";
 const COMETAPI_VIDEO_MODEL = process.env.COMETAPI_VIDEO_MODEL || "grok-imagine-video-1-5-preview";
+const NPEXAPI_VIDEO_MODEL = process.env.NPEXAPI_VIDEO_MODEL || "grok-imagine-video-1-5-preview";
 
 export const IMAGE_MODEL: ModelDef = {
   canonical: "gpt-image-2-6/flare-text-to-image",
   aliases: ["gpt-image-2.6/flare-text-to-image", "gpt-image-2.6-flare-text-to-image"],
   type: "image",
-  providers: ["kie", "cometapi"],
-  providerModel: { kie: KIE_IMAGE_MODEL, cometapi: COMETAPI_IMAGE_MODEL },
+  providers: ["kie", "cometapi", "npexapi"],
+  providerModel: { kie: KIE_IMAGE_MODEL, cometapi: COMETAPI_IMAGE_MODEL, npexapi: NPEXAPI_IMAGE_MODEL },
 };
 
 export const VIDEO_MODEL: ModelDef = {
   canonical: "grok-imagine-video-1-5-preview",
   aliases: ["grok-imagine-video-1.5-preview"],
   type: "video",
-  providers: ["kie", "cometapi"],
-  providerModel: { kie: KIE_VIDEO_MODEL, cometapi: COMETAPI_VIDEO_MODEL },
+  providers: ["kie", "cometapi", "npexapi"],
+  providerModel: { kie: KIE_VIDEO_MODEL, cometapi: COMETAPI_VIDEO_MODEL, npexapi: NPEXAPI_VIDEO_MODEL },
 };
 
 export const MERGE_MODEL: ModelDef = {

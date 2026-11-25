@@ -7,7 +7,7 @@ import * as React from "react";
  * الأنواع مطابقة لعقود واجهات الـAPI الخلفية (API contracts).
  */
 
-export type ProviderId = "kie" | "cometapi";
+export type ProviderId = "kie" | "cometapi" | "npexapi";
 /** استخدام المفتاح: صور وفيديو / صور فقط / فيديو فقط */
 export type KeyCapability = "both" | "image" | "video";
 
@@ -133,12 +133,14 @@ export interface TasksResponse {
 export const PROVIDER_LABELS: Record<string, string> = {
   kie: "kie.ai",
   cometapi: "CometAPI",
+  npexapi: "NpexAPI",
 };
 
 /** خيارات «طريقة الاتصال» الاحتياطية عند تعذر تحميل قائمة المزودين من السيرفر */
 export const DEFAULT_PROVIDER_ROWS: ProviderRow[] = [
   { id: "kie", name: "kie.ai", base_url: "https://api.kie.ai", auth_type: "bearer", auth_header: "Authorization", adapter_type: "kie", image_endpoint: "", video_endpoint: "", check_endpoint: "", enabled: 1, created_at: "" },
   { id: "cometapi", name: "CometAPI", base_url: "https://api.cometapi.com", auth_type: "bearer", auth_header: "Authorization", adapter_type: "cometapi", image_endpoint: "", video_endpoint: "", check_endpoint: "", enabled: 1, created_at: "" },
+  { id: "npexapi", name: "NpexAPI", base_url: "https://api.npexapi.com", auth_type: "bearer", auth_header: "Authorization", adapter_type: "cometapi", image_endpoint: "", video_endpoint: "", check_endpoint: "", enabled: 1, created_at: "" },
 ];
 
 /** نتيجة مطابقة النص الحر ل«طريقة الاتصال» بمزود من قاعدة البيانات */

@@ -1014,6 +1014,19 @@ async function seedProvidersAndMappings(): Promise<void> {
       video_endpoint: "/v1/videos/generations",
       check_endpoint: "/v1/videos/{task_id}",
     },
+    // NpexAPI — مزود مضاف بطلب المستخدم (بروتوكول متوافق مع OpenAI افتراضيًا).
+    // base_url التقديري: تحقق منه وعدّله من «إدارة المزودين» إذا كان موقعك يستخدم رابطًا آخر.
+    {
+      id: "npexapi",
+      name: "NpexAPI",
+      base_url: "https://api.npexapi.com",
+      auth_type: "bearer",
+      auth_header: "Authorization",
+      adapter_type: "cometapi",
+      image_endpoint: "/v1/images/generations",
+      video_endpoint: "/v1/videos/generations",
+      check_endpoint: "/v1/videos/{task_id}",
+    },
   ];
   for (const p of seededProviders) {
     await getTurso().execute({
@@ -1031,6 +1044,9 @@ async function seedProvidersAndMappings(): Promise<void> {
     // grok-imagine-video-1-5-preview — فيديو
     { canonical: "grok-imagine-video-1-5-preview", type: "video", provider_id: "kie", provider_model_name: "grok-imagine-video-1-5-preview", priority: 1 },
     { canonical: "grok-imagine-video-1-5-preview", type: "video", provider_id: "cometapi", provider_model_name: "grok-imagine-video-1-5-preview", priority: 2 },
+    // NpexAPI — موديلات بنفس الأسماء الافتراضية (عدّلها من إدارة الموديلات حسب أسعار/أسماء موقعك)
+    { canonical: "gpt-image-2-6/flare-text-to-image", type: "image", provider_id: "npexapi", provider_model_name: "gpt-image-2-6/flare-text-to-image", priority: 3 },
+    { canonical: "grok-imagine-video-1-5-preview", type: "video", provider_id: "npexapi", provider_model_name: "grok-imagine-video-1-5-preview", priority: 3 },
   ];
   for (const m of seededMappings) {
     await getTurso().execute({
