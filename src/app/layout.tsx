@@ -17,9 +17,7 @@ export const metadata: Metadata = {
     "Streamable HTTP",
   ],
   authors: [{ name: "MCP Media Generator" }],
-  icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
-  },
+  // الأيقونة تُسجَّل تلقائيًا من src/app/icon.svg (ملف محلي بدل رابط خارجي)
 };
 
 export default function RootLayout({
