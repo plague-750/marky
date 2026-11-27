@@ -1,6 +1,6 @@
 // سجل الموديلات — ديناميكي من جدول model_mappings (قسم 4 من المواصفة)
 // مع الاحتفاظ بتعريفات افتراضية كاحتياط عند تعذر قراءة قاعدة البيانات
-import { getEnabledMappingsForModel, listModelMappings } from "./turso";
+import { getEnabledMappingsForModel, listModelMappings, listProviders } from "./turso";
 
 export type TaskProvider = string;
 export type MediaType = "image" | "video" | "merge";
@@ -11,6 +11,8 @@ export interface ModelDef {
   type: MediaType;
   providers: string[]; // مزودو الخدمة بترتيب الأولوية — من جدول model_mappings
   providerModel: Record<string, string>; // اسم الموديل كما يُرسل لكل مزود
+  /** مزودون عليه خرائط معطّلة صراحةً — يُستبعدون حتى من التمرير المباشر */
+  blocked?: Record<string, boolean>;
 }
 
 // أسماء الموديلات الافتراضية (احتياط فقط — الحقيقة في قاعدة البيانات) قابلة للتجاوز بمتغيرات البيئة
@@ -58,6 +60,21 @@ function modelFromMappings(canonical: string, type: MediaType, rows: Awaited<Ret
   return { canonical, aliases: [], type, providers, providerModel };
 }
 
+/** المزودون الذين لديهم خرائط معطّلة صراحةً للاسم الموحد — يستثنون من التمرير المباشر */
+async function blockedProvidersFor(canonicals: string[]): Promise<Record<string, boolean>> {
+  const blocked: Record<string, boolean> = {};
+  try {
+    const rows = await listModelMappings();
+    for (const r of rows) {
+      if (r.enabled) continue;
+      if (canonicals.includes(r.canonical)) blocked[r.provider_id] = true;
+    }
+  } catch {
+    // تعذر القراءة — لا حجب
+  }
+  return blocked;
+}
+
 /**
  * حلّ الموديل ديناميكيًا من جدول model_mappings (قابل للتعديل من الواجهة):
  * يقبل الاسم canonical كما هو أو صيغته البديلة (نقاط ↔ شرطات).
@@ -73,10 +90,36 @@ export async function resolveModelDynamic(name: string): Promise<ModelDef | null
     if (!anyRows.length) continue;
     const type = (anyRows[0].type === "video" ? "video" : "image") as MediaType;
     const rows = await getEnabledMappingsForModel(c, type);
-    if (rows.length) return modelFromMappings(c, type, rows);
+    if (rows.length) {
+      const model = modelFromMappings(c, type, rows);
+      model.blocked = await blockedProvidersFor([c, clean]);
+      return model;
+    }
     return null; // الاسم موجود لكن كل خرائطه معطلة أو مزودوها معطلون
   }
   return null;
+}
+
+/**
+ * تمرير مباشر (Pass-through): اسم موديل غير مسجل في الخرائط — يُرسل كما هو لكل مزود مفعّل.
+ * هذا يجعل إضافة مزود + مفتاح + اسم موديل تعمل فورًا دون تعبئة خرائط يدوية.
+ */
+export async function buildPassthroughModel(name: string, type: "image" | "video"): Promise<ModelDef> {
+  const canonical = (name || "").trim();
+  let enabledProviderIds: string[] = [];
+  try {
+    enabledProviderIds = (await listProviders()).filter((p) => p.enabled).map((p) => p.id);
+  } catch {
+    enabledProviderIds = [];
+  }
+  const blocked: Record<string, boolean> = {};
+  try {
+    const rows = await listModelMappings({ canonical });
+    for (const r of rows) if (!r.enabled) blocked[r.provider_id] = true;
+  } catch {
+    // لا حجب
+  }
+  return { canonical, aliases: [], type, providers: enabledProviderIds, providerModel: {}, blocked };
 }
 
 /** كل الموديلات المفعّلة من قاعدة البيانات مجمّعة حسب الاسم الموحد — لقوائم الأدوات والجهوزية */

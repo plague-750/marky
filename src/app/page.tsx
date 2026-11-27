@@ -7,6 +7,7 @@ import { DashboardHeader } from "@/components/dashboard/header";
 import { KeyManager } from "@/components/dashboard/key-manager";
 import { ModelsManager } from "@/components/dashboard/models-manager";
 import { ProvidersManager } from "@/components/dashboard/providers-manager";
+import { QuickAdd } from "@/components/dashboard/quick-add";
 import { SiteFooter } from "@/components/dashboard/site-footer";
 import { TaskBoard } from "@/components/dashboard/task-board";
 import { useHealthPoller } from "@/components/dashboard/shared";
@@ -24,6 +25,16 @@ export default function Home() {
       <DashboardHeader health={health} loading={loading} failed={failed} onRetry={refresh} />
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:px-6 sm:py-8">
+        {/* (0) الإضافة السريعة — مزود + مفتاح + موديل في خطوة واحدة */}
+        <motion.section
+          aria-label="إضافة سريعة"
+          className="mb-6"
+          {...fadeUp}
+          transition={{ duration: 0.35, ease: "easeOut", delay: 0.02 }}
+        >
+          <QuickAdd />
+        </motion.section>
+
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
           {/* (أ) مدير المفاتيح */}
           <motion.section

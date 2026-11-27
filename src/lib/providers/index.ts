@@ -3,12 +3,14 @@
 import type { ProviderRuntime } from "./types";
 import { kieAdapter } from "./kie";
 import { cometapiAdapter } from "./cometapi";
+import { openrouterAdapter } from "./openrouter";
 import { getProviderById } from "../turso";
 import type { ProviderAdapter } from "./types";
 
 const ADAPTERS: Record<string, ProviderAdapter> = {
   kie: kieAdapter,
   cometapi: cometapiAdapter,
+  openrouter: openrouterAdapter,
 };
 
 /** المحول حسب نوعه المخزّن في جدول providers (adapter_type) — نوع غير معروف → خطأ واضح */

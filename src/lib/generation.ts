@@ -55,13 +55,21 @@ async function attemptCreation(taskId: string, model: ModelDef, input: GenInput,
   for (const key of pool) {
     // إعدادات المزود الحية من جدول providers + محوله حسب adapter_type — المزود معطل/محذوف → تخطّى مفاتيحه
     const resolved = await resolveProvider(key.protocol);
-    const providerModel = model.providerModel[key.protocol];
-    if (!resolved || !providerModel) {
+    if (!resolved) {
       await updateTask(taskId, {
         append_attempt: { provider: key.protocol, keyId: key.id, keyLabel: key.provider, ok: false, errorClass: "provider", error: "المزود غير مفعّل أو خريطة موديله محذوفة", at: new Date().toISOString() },
       });
       continue;
     }
+    // خريطة معطّلة صراحةً لهذا المزود → استبعاد حتى من التمرير المباشر
+    if (model.blocked?.[key.protocol]) {
+      await updateTask(taskId, {
+        append_attempt: { provider: key.protocol, keyId: key.id, keyLabel: key.provider, ok: false, errorClass: "provider", error: "خريطة هذا المزود للموديل معطّلة — تم الاستبعاد", at: new Date().toISOString() },
+      });
+      continue;
+    }
+    // تمرير مباشر: لا توجد خريطة للمزود → أرسل الاسم الموحد كما هو
+    const providerModel = model.providerModel[key.protocol] ?? model.canonical;
     const { provider, adapter } = resolved;
     try {
       // صور متزامنة (مزود يدعمها): النتيجة فورية

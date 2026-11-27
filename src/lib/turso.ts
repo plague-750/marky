@@ -629,7 +629,7 @@ export async function bumpKeyStats(
 // ----------------------------- المزودون (قسم 3 من المواصفة) -----------------------------
 
 export const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9_-]{0,40}$/i;
-export const ADAPTER_TYPES = new Set(["kie", "cometapi"]);
+export const ADAPTER_TYPES = new Set(["kie", "cometapi", "openrouter"]);
 export const AUTH_TYPES = new Set(["bearer", "header", "query"]);
 
 function rowToProvider(r: Record<string, unknown>): ProviderRow {

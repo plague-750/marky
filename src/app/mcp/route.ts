@@ -6,11 +6,11 @@ import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { IMAGE_MODEL, VIDEO_MODEL, resolveModel, listDynamicModels } from "@/lib/models";
+import { IMAGE_MODEL, VIDEO_MODEL, resolveModel, listDynamicModels, buildPassthroughModel } from "@/lib/models";
 import { runGeneration, retryGenerationTask } from "@/lib/generation";
 import { runMerge, retryMergeTask } from "@/lib/merge";
 import { refreshTask } from "@/lib/refresh";
-import { getTask, listRecentTasks, parseUrls } from "@/lib/turso";
+import { getTask, listRecentTasks, parseUrls, listModelMappings } from "@/lib/turso";
 import { RuleError } from "@/lib/errors";
 import {
   fmtImageDone,
@@ -71,7 +71,7 @@ async function buildTools(): Promise<ToolDef[]> {
         type: "object",
         properties: {
           prompt: { type: "string", minLength: 1, description: "What to draw. Detailed prompts give better results." },
-          model: { type: "string", enum: imageModels, default: imageModels[0] },
+          model: { type: "string", description: `Model name. Default: ${imageModels[0]}. Registered models: ${imageModels.join(" ، ")}. ANY other model name your provider supports is accepted and sent as-is (pass-through).`, default: imageModels[0] },
           aspect_ratio: { type: "string", enum: IMAGE_ASPECTS, default: "auto" },
           resolution: { type: "string", enum: ["1K", "2K", "4K"], default: "1K" },
           background: { type: "string", enum: ["auto", "transparent", "opaque"], default: "auto", description: "Only applied at 1K." },
@@ -90,7 +90,7 @@ async function buildTools(): Promise<ToolDef[]> {
         properties: {
           prompt: { type: "string", maxLength: 4096, description: "Scene description. Dialogue in the prompt is spoken in the video." },
           image_url: { type: "string", description: "Optional public image URL as the first frame (image-to-video)." },
-          model: { type: "string", enum: videoModels, default: videoModels[0] },
+          model: { type: "string", description: `Model name. Default: ${videoModels[0]}. Registered models: ${videoModels.join(" ، ")}. ANY other model name your provider supports is accepted and sent as-is (pass-through).`, default: videoModels[0] },
           aspect_ratio: { type: "string", enum: VIDEO_ASPECTS, default: "auto" },
           resolution: { type: "string", enum: ["480p", "720p", "1080p"], default: "480p" },
           enable_audio: { type: "boolean", default: true },
@@ -207,11 +207,36 @@ async function availableModelsText(type: "image" | "video"): Promise<string> {
   try {
     const dyn = await listDynamicModels();
     const list = dyn.filter((m) => m.type === type).map((m) => m.canonical);
-    if (list.length) return list.join(" ، ");
+    if (list.length) return `${list.join(" ، ")} — ويمكن أيضًا تمرير أي اسم موديل آخر وسإرساله كما هو للمزودين`;
   } catch {
     // احتياط ثابت
   }
   return type === "image" ? IMAGE_MODEL.canonical : VIDEO_MODEL.canonical;
+}
+
+/**
+ * حلّ اسم الموديل مع التمرير المباشر:
+ * مسجل في الخرائط → تعريفه الكامل | غير مسجل → يُرسل كما هو لكل مزود مفعّل (خطأ الطول فقط يُرفض)
+ */
+async function resolveModelOrPassthrough(modelInput: string, type: "image" | "video"): Promise<ModelDef | { error: string }> {
+  const clean = (modelInput || "").trim();
+  if (!clean) return { error: "اسم الموديل فارغ" };
+  if (clean.length > 160) return { error: `اسم الموديل طويل جدًا (${clean.length} حرفًا — الحد 160)` };
+  const resolved = await resolveModel(clean);
+  if (resolved && resolved.type === type) return resolved;
+  if (resolved && resolved.type !== type) {
+    return { error: `الموديل «${clean}» موديل ${resolved.type === "video" ? "فيديو" : "صور"} وليس ${type === "video" ? "فيديو" : "صور"}` };
+  }
+  // غير مسجل — لكن يوجد اسم موديل بالطول الكامل معطّل بالكامل → حكمه بيد المستخدم (لا نمرّره)
+  try {
+    const anyRows = await listModelMappings({ canonical: clean });
+    if (anyRows.length) {
+      return { error: `الموديل «${clean}» موجود لكن كل خرائطه معطلة — فعّل خريطة من إدارة الموديلات` };
+    }
+  } catch {
+    // تجاهل — استمر في التمرير
+  }
+  return buildPassthroughModel(clean, type);
 }
 
 // ----------------------------- منطق الأدوات -----------------------------
@@ -222,10 +247,11 @@ async function callTool(name: string, args: Record<string, unknown>, extra: Tool
       const prompt = String(args.prompt ?? "").trim();
       if (!prompt) return textResult("❌ المعطى prompt مطلوب لتوليد الصورة.", true);
       const modelInput = args.model ? String(args.model) : IMAGE_MODEL.canonical;
-      const model = await resolveModel(modelInput);
-      if (!model || model.type !== "image") {
-        return textResult(`❌ موديل غير معروف أو غير مفعّل: ${modelInput}. المتاح للصور: ${await availableModelsText("image")}`, true);
+      const modelRes = await resolveModelOrPassthrough(modelInput, "image");
+      if ("error" in modelRes) {
+        return textResult(`❌ ${modelRes.error}. المتاح للصور: ${await availableModelsText("image")}`, true);
       }
+      const model = modelRes;
       const outcome = await runGeneration({
         type: "image",
         model,
@@ -248,10 +274,11 @@ async function callTool(name: string, args: Record<string, unknown>, extra: Tool
       if (!prompt) return textResult("❌ المعطى prompt مطلوب لتوليد الفيديو.", true);
       if (prompt.length > 4096) return textResult("❌ طول الوصف يتجاوز 4096 حرفًا.", true);
       const modelInput = args.model ? String(args.model) : VIDEO_MODEL.canonical;
-      const model = await resolveModel(modelInput);
-      if (!model || model.type !== "video") {
-        return textResult(`❌ موديل غير معروف أو غير مفعّل: ${modelInput}. المتاح للفيديو: ${await availableModelsText("video")}`, true);
+      const modelRes = await resolveModelOrPassthrough(modelInput, "video");
+      if ("error" in modelRes) {
+        return textResult(`❌ ${modelRes.error}. المتاح للفيديو: ${await availableModelsText("video")}`, true);
       }
+      const model = modelRes;
       const imageUrl = typeof args.image_url === "string" && /^https?:\/\//i.test(args.image_url) ? args.image_url : undefined;
       const outcome = await runGeneration({
         type: "video",
